@@ -32,11 +32,50 @@ same thing in software, per frame:
 
 ## Install
 
-Grab the archive for your OS from the
-[latest release](../../releases/latest) and unpack it. (If your OS has no
-archive in the release, build from source, see below.) Inside is
-`Datamosh.ofx.bundle`. Copy the whole bundle folder into the system OpenFX
-plugin directory, then restart the host.
+**One command** (downloads the latest release, checks its SHA-256, installs it):
+
+```sh
+# Linux / macOS (asks for your password through sudo)
+curl -fsSL https://raw.githubusercontent.com/Woysful/ofx-datamosh/main/install.sh | sh
+```
+
+```powershell
+# Windows, in PowerShell started as Administrator
+irm https://raw.githubusercontent.com/Woysful/ofx-datamosh/main/install.ps1 | iex
+```
+
+Then restart DaVinci Resolve. The latest release currently has archives for
+Linux x86_64 and Windows x64; on macOS build from source (see below).
+
+**Installer scripts.** `install.sh` (Linux/macOS) and `install.ps1` (Windows)
+also ship in the repository and in every release archive. In a terminal they
+ask where to take the plugin from:
+
+```
+Datamosh OFX installer (linux, Linux-x86-64)
+  1) local build:    build-release/linux/Datamosh.ofx.bundle (2026-11-04 22:03)
+  2) latest release: v1.4.0 from github.com/Woysful/ofx-datamosh
+Choose 1 or 2, q to quit [1]:
+```
+
+* The local build is the newest one for the current OS from the unpacked
+  archive next to the script, `build-release/`, `build/` or the archives in
+  `dist/`. Bundles built for another OS are never picked.
+* The release download is checked against the SHA-256 GitHub publishes for
+  the file (or a `SHA256SUMS` file in the release) and refused on mismatch.
+* Without a terminal (called from another script) they use the local build,
+  or download the release when there is none.
+* `--local` / `--download` (`-Local` / `-Download`) skip the question, a path
+  to a bundle or zip installs exactly that, `--dest DIR` (`-Dest DIR`)
+  changes the target directory. Help: `./install.sh --help`,
+  `Get-Help .\install.ps1 -Detailed`.
+* `install.sh` uses sudo only for the copy step when the target directory
+  needs it. `install.ps1` must run as Administrator.
+
+**Manual install.** Unpack the archive for your OS from the
+[latest release](../../releases/latest) and copy the whole
+`Datamosh.ofx.bundle` folder into the system OpenFX plugin directory, then
+restart the host.
 
 | OS | Plugin directory |
 |---|---|
@@ -69,15 +108,6 @@ sudo cp -R Datamosh.ofx.bundle /Library/OFX/Plugins/
 # the binary is not notarised; clear the quarantine flag so Resolve may load it
 sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/Datamosh.ofx.bundle
 ```
-
-If you built from source, `install.sh` (Linux/macOS) or `install.ps1`
-(Windows) does the same. Without arguments they pick the newest build for
-the current OS from the unpacked archive next to them, `build-release/`,
-`build/` or the archives in `dist/`, and refuse bundles built for another OS.
-You can also pass a bundle or a zip: `sudo ./install.sh dist/ofx-datamosh-v1.4-linux-x86_64.zip`,
-`.\install.ps1 -Path <bundle-or-zip>`. Both take a target directory
-(`--dest DIR` / `-Dest DIR`) and show help with `--help` / `Get-Help .\install.ps1`.
-
 ## Using it in DaVinci Resolve
 
 1. Put the two clips next to each other on the timeline (a plain cut).
@@ -168,7 +198,7 @@ Or with plain CMake:
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-sudo ./install.sh
+./install.sh --local
 ```
 
 On macOS add `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` to the configure
@@ -226,9 +256,13 @@ version from `packaging/Info.plist`.
 | windows | MinGW-w64 cross compiler on Linux/macOS, or natively in Git Bash / MSYS2 on Windows | `g++-mingw-w64-x86-64-posix` (Debian/Ubuntu), `mingw64-gcc-c++` (Fedora), `mingw-w64-gcc` (Arch), `mingw-w64` (Homebrew) |
 | macos | natively on a Mac (universal arm64 + x86_64), or with [osxcross](https://github.com/tpoechtrager/osxcross) on Linux | Xcode command line tools, or osxcross `target/bin` on `PATH` |
 
-Platforms without a toolchain are skipped with a message. To publish, attach
-the files from `dist/` to a GitHub release, e.g.
-`gh release create v1.5.0 dist/*.zip`.
+Platforms without a toolchain are skipped with a message. `dist/SHA256SUMS`
+lists the checksums of the archives. To publish, attach the files from
+`dist/` to a GitHub release, e.g.
+`gh release create v1.5.0 dist/*.zip dist/SHA256SUMS`. The installers find
+the archive for each OS by its name ending (`-linux-x86_64.zip`,
+`-windows-x64.zip`, `-macos-universal.zip`), so keep the names `build.sh`
+gives them.
 
 ## Test tools
 
@@ -256,7 +290,7 @@ src/datamosh_plugin.cpp  OpenFX glue: describe, params, cut detection, caches, r
 tools/mosh_test.cpp      offline harness for the core
 tools/mock_host.cpp      minimal OpenFX host for end-to-end plugin tests
 packaging/Info.plist     bundle metadata
-install.sh / install.ps1 copy the built bundle into the system plugin directory
+install.sh / install.ps1 install a local build or the latest release (SHA-256 checked)
 build.sh                 release archives for Linux, Windows and macOS into dist/
 cmake/                   toolchain files for MinGW-w64 and osxcross cross builds
 ```

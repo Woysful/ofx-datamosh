@@ -48,7 +48,7 @@ Examples:
   ./build.sh linux windows       # only these two
   ./build.sh -c -v v1.5.0        # clean release build labelled v1.5.0
   ./build.sh -i linux            # build for Linux and install it
-  gh release create v1.5.0 dist/*.zip
+  gh release create v1.5.0 dist/*.zip dist/SHA256SUMS
 USAGE
 }
 
@@ -267,6 +267,15 @@ for t in $TARGETS; do
   if ( "build_$t" ); then built="$built $t"; else failed="$failed $t"; warn "$t: build failed"; fi
 done
 
+write_sums() {
+  [ "$ZIP" = 1 ] && [ -n "$built" ] || return 0
+  if have sha256sum; then sum="sha256sum"
+  elif have shasum; then sum="shasum -a 256"
+  else warn "no sha256sum or shasum, SHA256SUMS not written"; return 0; fi
+  (cd "$DIST" && $sum ofx-datamosh-*.zip > SHA256SUMS)
+  echo "    $DIST/SHA256SUMS"
+}
+
 install_native() {
   bundle="$WORK/$NATIVE/Datamosh.ofx.bundle"
   if [ "$NATIVE" = windows ]; then
@@ -290,6 +299,8 @@ install_native() {
     sudo OFX_INSTALL_DIR="${OFX_INSTALL_DIR:-}" sh "$@"
   fi
 }
+
+write_sums
 
 if [ "$INSTALL" = 1 ]; then
   case " $built " in
