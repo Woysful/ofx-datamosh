@@ -139,8 +139,7 @@ Or delete the bundle by hand:
 | macOS | `sudo rm -rf /Library/OFX/Plugins/Datamosh.ofx.bundle` |
 | Windows (Administrator) | `Remove-Item -Recurse -Force "C:\Program Files\Common Files\OFX\Plugins\Datamosh.ofx.bundle"` |
 
-Restart DaVinci Resolve afterwards. Clips that still use the effect show it
-as missing until you remove it from them.
+Restart DaVinci Resolve afterwards.
 ## Using it in DaVinci Resolve
 
 1. Put the two clips next to each other on the timeline (a plain cut).
