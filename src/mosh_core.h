@@ -335,7 +335,24 @@ inline void moshStep(const Image& prev, const Image& cur, const MotionField& mf,
     }
 }
 
-enum class Recovery { Blocks = 0, Dissolve = 1, HardCut = 2 };
+enum class Recovery { Blocks = 0, Dissolve = 1, HardCut = 2, MotionRefresh = 3, StructureFirst = 4, LumaReveal = 5 };
+enum class Curve { Linear = 0, Smooth = 1, EaseIn = 2, EaseOut = 3 };
+
+inline float clamp01(float v) { return std::min(std::max(v, 0.f), 1.f); }
+inline float smoothstep01(float v) {
+    v = clamp01(v);
+    return v * v * (3.f - 2.f * v);
+}
+
+inline float shapeCurve(float q, Curve c) {
+    q = clamp01(q);
+    switch (c) {
+        case Curve::Smooth: return smoothstep01(q);
+        case Curve::EaseIn: return q * q;
+        case Curve::EaseOut: return 1.f - (1.f - q) * (1.f - q);
+        default: return q;
+    }
+}
 
 inline float blockHash(int bx, int by, int seed) {
     uint32_t h = (uint32_t)bx * 73856093u ^ (uint32_t)by * 19349663u ^ (uint32_t)seed * 83492791u;
@@ -345,12 +362,194 @@ inline float blockHash(int bx, int by, int seed) {
     return float(h & 0xffffffu) / 16777216.f;
 }
 
-// Bring the real incoming picture back. q in [0,1] is recovery progress.
-// Blocks: macroblocks pop back one by one, like an intra-refresh stream.
-inline void compose(const Image& acc, const Image& to, Recovery mode, float q, int block, int seed,
-                    Image& out, const ParallelFor& pf) {
+// Separable box blur of all four channels, edges clamped.
+inline void boxBlur(const Image& src, int r, Image& out, const ParallelFor& pf) {
+    out.resize(src.w, src.h);
+    if (r <= 0) {
+        out.px = src.px;
+        return;
+    }
+    Image tmp(src.w, src.h);
+    const float inv = 1.f / float(2 * r + 1);
+    pf(src.h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int k = -r; k <= r; ++k) {
+                const float* p = src.clampedAt(k, y);
+                for (int c = 0; c < 4; ++c) s[c] += p[c];
+            }
+            for (int x = 0; x < src.w; ++x) {
+                float* o = tmp.at(x, y);
+                for (int c = 0; c < 4; ++c) o[c] = s[c] * inv;
+                const float* add = src.clampedAt(x + r + 1, y);
+                const float* sub = src.clampedAt(x - r, y);
+                for (int c = 0; c < 4; ++c) s[c] += add[c] - sub[c];
+            }
+        }
+    });
+    pf(src.w, [&](int x0, int x1) {
+        for (int x = x0; x < x1; ++x) {
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int k = -r; k <= r; ++k) {
+                const float* p = tmp.clampedAt(x, k);
+                for (int c = 0; c < 4; ++c) s[c] += p[c];
+            }
+            for (int y = 0; y < src.h; ++y) {
+                float* o = out.at(x, y);
+                for (int c = 0; c < 4; ++c) o[c] = s[c] * inv;
+                const float* add = tmp.clampedAt(x, y + r + 1);
+                const float* sub = tmp.clampedAt(x, y - r);
+                for (int c = 0; c < 4; ++c) s[c] += add[c] - sub[c];
+            }
+        }
+    });
+}
+
+// Motion refresh: the stream "recovers" the way an intra-refresh encoder
+// does, inside the decode loop instead of as a composite on top of it. Blocks
+// where the new shot changes the most are refreshed first; refreshed blocks
+// are pulled towards the real picture every step but still get decoded as
+// P-blocks, so the smear around them keeps flowing in until it is washed out.
+struct RefreshStep {
+    float q = 0.f;          // recovery progress at this step, 0..1
+    float softness = 0.5f;  // 0 = refreshed blocks snap to the real picture
+    float jitter = 0.15f;   // share of randomness in the refresh order
+    int seed = 0;
+};
+
+inline void refreshStep(const Image& prev, const Image& cur, const MotionField& mf, const RefreshStep& rs,
+                        std::vector<uint8_t>& refreshed, Image& acc, const ParallelFor& pf) {
+    const size_t nb = (size_t)mf.bw * mf.bh;
+    if (refreshed.size() != nb) refreshed.assign(nb, 0);
+    if (rs.q <= 0.f || nb == 0) return;
+
+    std::vector<float> activity(nb, 0.f);
+    pf(mf.bh, [&](int b0, int b1) {
+        for (int by = b0; by < b1; ++by)
+            for (int bx = 0; bx < mf.bw; ++bx) {
+                float s = 0.f;
+                int n = 0;
+                for (int y = by * mf.block; y < std::min((by + 1) * mf.block, cur.h); y += 2)
+                    for (int x = bx * mf.block; x < std::min((bx + 1) * mf.block, cur.w); x += 2) {
+                        const float* c = cur.at(x, y);
+                        const float* p = prev.at(x, y);
+                        s += std::fabs(c[0] - p[0]) + std::fabs(c[1] - p[1]) + std::fabs(c[2] - p[2]);
+                        ++n;
+                    }
+                activity[mf.index(bx, by)] = n ? s / float(n) : 0.f;
+            }
+    });
+    // Spread activity over neighbouring blocks so whole regions refresh
+    // together instead of a scatter of single blocks.
+    std::vector<float> spread(nb, 0.f);
+    for (int by = 0; by < mf.bh; ++by)
+        for (int bx = 0; bx < mf.bw; ++bx) {
+            float s = 0.f, wsum = 0.f;
+            for (int oy = -2; oy <= 2; ++oy)
+                for (int ox = -2; ox <= 2; ++ox) {
+                    const int qx = bx + ox, qy = by + oy;
+                    if (qx < 0 || qy < 0 || qx >= mf.bw || qy >= mf.bh) continue;
+                    const float w = (ox == 0 && oy == 0) ? 2.f : 1.f / float(std::abs(ox) + std::abs(oy));
+                    s += w * activity[mf.index(qx, qy)];
+                    wsum += w;
+                }
+            spread[mf.index(bx, by)] = s / wsum;
+        }
+    std::vector<int> order(nb);
+    for (size_t i = 0; i < nb; ++i) order[i] = (int)i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return spread[a] < spread[b]; });
+    const float denom = nb > 1 ? float(nb - 1) : 1.f;
+    for (size_t r = 0; r < nb; ++r) {
+        const int i = order[r];
+        const float score = (1.f - rs.jitter) * (float(r) / denom) +
+                            rs.jitter * blockHash(i % mf.bw, i / mf.bw, rs.seed + 101);
+        if (rs.q >= 1.f || score > 1.f - rs.q) refreshed[i] = 1;
+    }
+
+    // Refreshed blocks converge faster towards the end so nothing is left to pop.
+    const float base = 1.f - 0.85f * clamp01(rs.softness);
+    const float rate = rs.q >= 1.f ? 1.f : base + (1.f - base) * rs.q * rs.q;
+    // Blocks still waiting for their refresh fade in over the last stretch, so
+    // the final frame has nothing left to pop.
+    const float tail = smoothstep01((rs.q - 0.8f) / 0.2f);
+    pf(cur.h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const int by = std::min(y / mf.block, mf.bh - 1);
+            for (int x = 0; x < cur.w; ++x) {
+                const float k = refreshed[mf.index(std::min(x / mf.block, mf.bw - 1), by)] ? rate : tail;
+                if (k <= 0.f) continue;
+                float* a = acc.at(x, y);
+                const float* c = cur.at(x, y);
+                for (int ch = 0; ch < 4; ++ch) a[ch] += k * (c[ch] - a[ch]);
+            }
+        }
+    });
+}
+
+inline float refreshedShare(const std::vector<uint8_t>& refreshed) {
+    if (refreshed.empty()) return 0.f;
+    size_t n = 0;
+    for (uint8_t r : refreshed) n += r;
+    return float(n) / float(refreshed.size());
+}
+
+struct ComposeParams {
+    Recovery mode = Recovery::Blocks;
+    float softness = 0.5f;      // width of the soft edge of the reveal, 0..1
+    int block = 16;
+    int seed = 0;
+    bool invertReveal = false;  // Luma reveal: dark areas first
+};
+
+// Bring the real incoming picture back over the moshed one. q in [0,1] is
+// recovery progress (already shaped by the recovery curve).
+//   Blocks:         macroblocks come back in random order, each fading in
+//                   over a window set by softness (0 = they pop).
+//   Dissolve:       crossfade.
+//   HardCut:        the real picture as soon as recovery starts.
+//   MotionRefresh:  done inside the mosh chain (refreshStep); here only the
+//                   final frame snaps to the real picture.
+//   StructureFirst: the edges and texture of the new shot appear first,
+//                   painted with the smeared colours; the colours follow.
+//   LumaReveal:     the new shot shows through its bright areas first.
+inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, float q, Image& out,
+                    const ParallelFor& pf) {
     out.resize(to.w, to.h);
-    q = std::min(std::max(q, 0.f), 1.f);
+    q = clamp01(q);
+    const float s = clamp01(cp.softness);
+    const int block = std::max(1, cp.block);
+
+    if (cp.mode == Recovery::StructureFirst) {
+        const int r = std::max(3, block);
+        Image lowA, lowT;
+        boxBlur(acc, r, lowA, pf);
+        boxBlur(to, r, lowT, pf);
+        const float lag = 0.1f + 0.5f * s;  // colours start when structure is this far in
+        const float kd = smoothstep01(q / (1.f - lag));
+        const float kc = smoothstep01((q - lag) / (1.f - lag));
+        pf(to.h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < to.w; ++x) {
+                    const float* a = acc.at(x, y);
+                    const float* t = to.at(x, y);
+                    const float* la = lowA.at(x, y);
+                    const float* lt = lowT.at(x, y);
+                    float* o = out.at(x, y);
+                    for (int ch = 0; ch < 4; ++ch) {
+                        const float low = la[ch] + kc * (lt[ch] - la[ch]);
+                        const float high = (a[ch] - la[ch]) + kd * ((t[ch] - lt[ch]) - (a[ch] - la[ch]));
+                        o[ch] = low + high;
+                    }
+                }
+        });
+        return;
+    }
+
+    Image key;
+    if (cp.mode == Recovery::LumaReveal) boxBlur(to, std::max(2, block / 2), key, pf);
+
+    const float bw = 0.6f * s;           // Blocks: fade window per block
+    const float fw = 0.05f + 0.6f * s;   // LumaReveal: soft edge width
     pf(to.h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             for (int x = 0; x < to.w; ++x) {
@@ -358,23 +557,30 @@ inline void compose(const Image& acc, const Image& to, Recovery mode, float q, i
                 const float* t = to.at(x, y);
                 float* o = out.at(x, y);
                 float k;  // weight of the incoming picture
-                switch (mode) {
-                    case Recovery::Blocks:
-                        k = (q >= 1.f || (q > 0.f && blockHash(x / block, y / block, seed) < q)) ? 1.f : 0.f;
+                switch (cp.mode) {
+                    case Recovery::Blocks: {
+                        const float h = blockHash(x / block, y / block, cp.seed);
+                        if (q >= 1.f) k = 1.f;
+                        else if (bw <= 0.f) k = (q > 0.f && h < q) ? 1.f : 0.f;
+                        else k = clamp01((q * (1.f + bw) - h) / bw);
                         break;
-                    case Recovery::Dissolve:
-                        k = q;
+                    }
+                    case Recovery::Dissolve: k = q; break;
+                    case Recovery::MotionRefresh: k = q >= 1.f ? 1.f : 0.f; break;
+                    case Recovery::LumaReveal: {
+                        const float* kp = key.at(x, y);
+                        float l = clamp01(0.299f * kp[0] + 0.587f * kp[1] + 0.114f * kp[2]);
+                        if (cp.invertReveal) l = 1.f - l;
+                        k = smoothstep01((q * (1.f + fw) - (1.f - l)) / fw);
                         break;
-                    default:
-                        k = q > 0.f ? 1.f : 0.f;
-                        break;
+                    }
+                    default: k = q > 0.f ? 1.f : 0.f; break;
                 }
                 for (int ch = 0; ch < 4; ++ch) o[ch] = a[ch] + k * (t[ch] - a[ch]);
             }
         }
     });
 }
-
 // Debug view: direction as colour (x -> red, y -> green), intra blocks white.
 inline void visualizeMotion(const MotionField& mf, int range, int w, int h, Image& out, const ParallelFor& pf) {
     out.resize(w, h);

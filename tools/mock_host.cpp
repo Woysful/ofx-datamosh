@@ -254,7 +254,7 @@ static bool readClip(const char* path, int w, int h, int n, Clip& c) {
 #define CHECK(st, what) do { OfxStatus _s = (st); if (_s != kOfxStatOK && _s != kOfxStatReplyDefault) { fprintf(stderr, "%s failed: %d\n", what, (int)_s); return 1; } } while (0)
 
 int main(int argc, char** argv) {
-    if (argc < 8) { fprintf(stderr, "usage: %s plugin.ofx from.rgb to.rgb w h frames out.rgb [view]\n", argv[0]); return 1; }
+    if (argc < 8) { fprintf(stderr, "usage: %s plugin.ofx from.rgb to.rgb w h frames out.rgb [view] [param=value ...]\n", argv[0]); return 1; }
     const int w = atoi(argv[4]), h = atoi(argv[5]), n = atoi(argv[6]);
     const int view = argc > 8 ? atoi(argv[8]) : 0;
     const bool filter = true;
@@ -312,6 +312,13 @@ int main(int argc, char** argv) {
         inst.params.params[kOfxImageEffectTransitionParamName] = std::move(p);
     }
     inst.params.params["view"]->ival = view;
+    for (int a = 9; a < argc; ++a) {  // param=value overrides
+        const char* eq = strchr(argv[a], '=');
+        auto it = eq ? inst.params.params.find(std::string(argv[a], eq - argv[a])) : inst.params.params.end();
+        if (it == inst.params.params.end()) { fprintf(stderr, "unknown param override: %s\n", argv[a]); return 1; }
+        if (it->second->type == kOfxParamTypeDouble) it->second->dval = atof(eq + 1);
+        else it->second->ival = atoi(eq + 1);
+    }
 
     Clip* out = inst.clips[kOfxImageEffectOutputClipName].get();
     Clip *from = nullptr, *to = nullptr, *source = nullptr;
@@ -337,6 +344,28 @@ int main(int argc, char** argv) {
         c->props.s[kOfxImageEffectPropPixelDepth] = {kOfxBitDepthFloat};
     }
     CHECK(pl->mainEntry(kOfxActionCreateInstance, &inst, nullptr, nullptr), "createInstance");
+    if (getenv("MOCK_PARAMS")) {  // dump parameter layout: group, enabled state
+        auto dump = [&]() {
+            for (auto& kv : inst.params.params) {
+                auto& pp = kv.second->props;
+                auto par = pp.s.find(kOfxParamPropParent);
+                auto en = pp.i.find(kOfxParamPropEnabled);
+                printf("  %-16s %-12s group=%-12s enabled=%s\n", kv.first.c_str(), kv.second->type.c_str() + 12,
+                       par != pp.s.end() ? par->second[0].c_str() : "-",
+                       en != pp.i.end() ? (en->second[0] ? "yes" : "NO") : "default");
+            }
+        };
+        dump();
+        inst.params.params["cutMode"]->ival = 1;
+        inst.params.params["recoverMode"]->ival = 5;
+        PropSet ic;
+        ic.s[kOfxPropName] = {"recoverMode"};
+        ic.s[kOfxPropChangeReason] = {kOfxChangeUserEdited};
+        CHECK(pl->mainEntry(kOfxActionInstanceChanged, &inst, H(&ic), nullptr), "instanceChanged");
+        printf("after cutMode=Manual, recoverMode=Luma reveal:\n");
+        dump();
+        return 0;
+    }
 
     FILE* fo = fopen(argv[7], "wb");
     if (!fo) return 1;
@@ -369,6 +398,8 @@ int main(int argc, char** argv) {
         }
 
         from->requested.clear(); to->requested.clear(); out->live.clear();
+        if (getenv("MOCK_PURGE"))  // render every frame from a cold cache, like scrubbing
+            CHECK(pl->mainEntry(kOfxActionPurgeCaches, &inst, nullptr, nullptr), "purgeCaches");
         CHECK(pl->mainEntry(kOfxImageEffectActionRender, &inst, H(&inArgs), nullptr), "render");
         if (out->live.empty()) { fprintf(stderr, "render did not fetch output image\n"); return 1; }
         toRgb(out->live.back()->data);

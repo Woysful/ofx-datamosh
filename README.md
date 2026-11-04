@@ -27,8 +27,10 @@ same thing in software, per frame:
 4. Drags the reference along those vectors and adds each step's prediction
    residual, which bleeds the new colours in. Optionally decodes every
    P-frame several times (duplicated P-frames, the "bloom").
-5. Brings the real picture back: macroblocks refresh randomly like an
-   intra-refresh stream, or a dissolve, or a hard cut.
+5. Brings the real picture back: by refreshing the regions where the new
+   shot moves first inside the mosh, by letting the new shot's shapes appear
+   before its colours, through its bright areas, block by block, as a
+   dissolve or as a hard cut.
 
 ## Install
 
@@ -170,34 +172,84 @@ cut (bounded by **Max Motion Steps**). Tips if it is still slow:
 
 ## Parameters
 
+The parameters are split into groups in the inspector. Parameters that do
+nothing with the current settings are greyed out (Cut Frame in Auto mode,
+Dark Areas First outside Luma reveal, and so on).
+
+**Cut Detection**
+
 | Parameter | Default | Meaning |
 |---|---|---|
 | Cut | Auto detect | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame. |
 | Cut Frame | 0 | Manual mode: first frame of the new shot, in the clip's own frame numbers (Diagnostics shows `T`). |
 | Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
+
+**Mosh**
+
+| Parameter | Default | Meaning |
+|---|---|---|
 | Mosh Length | 30 | Frames after the cut the mosh lasts, recovery included. |
-| Block Size | 16 | Macroblock size in px. Bigger = chunkier and faster. |
-| Search Range | 48 | Max motion per step, px. Raise for very fast pans. |
-| Motion Scale | 1.0 | Multiplies vectors. >1 exaggerates, <0 inverts. |
 | Residual Strength | 0.6 | 0 = pure smear of the old frame, 1 = codec-accurate, >1 overdrive. |
 | Bloom (P-frame Repeat) | 1 | Decode each P-frame N times. 2-4 gives the classic melting, over-saturated look. |
+| Motion Scale | 1.0 | Multiplies vectors. >1 exaggerates, <0 inverts. |
+| Clamp Levels | on | Keep RGB in 0..1 like an 8-bit decoder. |
+
+**Motion Estimation**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Block Size | 16 | Macroblock size in px. Bigger = chunkier and faster. |
+| Search Range | 48 | Max motion per step, px. Raise for very fast pans. |
 | Intra Threshold | 0.35 | Blocks predicted worse than this show the new picture directly. 1 = off. |
 | Smooth Vectors | on | Median filter on the vector field. |
 | Fill Flat Areas | on | Textureless blocks take their neighbours' motion so flat regions flow too. |
+
+**Recovery**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Recovery | Motion refresh | How the real picture comes back, see below. |
 | Recovery Start | 0.8 | Fraction of the mosh at which the real picture starts to return. |
-| Recovery | Block refresh | Block refresh / Dissolve / Hard cut. |
+| Recovery Curve | Linear | Pace of the recovery: Linear, Smooth (slow-fast-slow), Ease in (slow start), Ease out (slow end). |
+| Softness | 0.5 | How gradual the recovery is; what exactly it softens depends on the mode, see below. |
+| Dark Areas First | off | Luma reveal only: reveal dark areas first. |
+| Seed | 0 | Random order of Block refresh and Motion refresh. |
+
+**Performance & Debug**
+
+| Parameter | Default | Meaning |
+|---|---|---|
 | Max Motion Steps | 48 | Cap on frame pairs analysed per frame when the cache is cold. |
-| Clamp Levels | on | Keep RGB in 0..1 like an 8-bit decoder. |
-| Seed | 0 | Changes which blocks refresh first. |
 | View | Result | "Motion vectors" shows the field used for the frame (x -> red, y -> green, intra = white). "Diagnostics" overlays numbers. |
+
+### Recovery modes
+
+![recovery modes](docs/recovery.jpg)
+
+*Frames 14, 18, 21, 24 and 27 of a 30-frame mosh, Recovery Start 0.4,
+Softness 0.5.*
+
+| Mode | What happens | Softness controls |
+|---|---|---|
+| Motion refresh | The stream recovers inside the mosh, like an intra-refresh encoder. Regions where the new shot moves or changes come back first, whole areas at a time; static areas stay moshed longest. Refreshed blocks keep being decoded as P-blocks, so the smear around them keeps flowing in until it washes out. | how long the smear lingers in refreshed blocks |
+| Structure first | The shapes and texture of the new shot appear first, painted with the smeared colours of the old one; then the colours follow. The smoothest, most "one picture turning into another" option. | how long the old colours stay after the shapes arrive |
+| Luma reveal | The new shot shows through its bright areas first (or dark ones, with Dark Areas First). | width of the soft edge |
+| Block refresh | Macroblocks come back in random order. | how long each block takes to fade in (0 = they pop) |
+| Dissolve | Crossfade from the moshed picture to the real one. | - |
+| Hard cut | The real picture as soon as recovery starts. | - |
+
+Up to version 1.4 the default was Block refresh, and Softness did not
+exist. To get the 1.4 look back, choose Block refresh and set Softness to 0;
+the result is then identical to 1.4.
 
 Looks to start from:
 
 * Classic melt: Bloom 2-4, Residual 0.4-0.8, Motion Scale 1-1.5.
+* Long, flowing transition between shots: Recovery Motion refresh or
+  Structure first, Recovery Start 0.4-0.5, Recovery Curve Smooth.
 * Pure liquid smear of the old picture, no new colours: Residual 0,
   Intra Threshold 1.
 * Short glitch: Mosh Length 12, Recovery Start 0.6, Recovery Hard cut.
-
 ## Reading the Diagnostics view
 
 Set **View** to **Diagnostics** on a frame just after the cut:
@@ -210,6 +262,9 @@ Set **View** to **Diagnostics** on a frame just after the cut:
   times (no temporal access), so there is no motion to work with.
 * `MV` is the mean motion vector length in px. `CACHED` / `FULL` says
   whether the frame reused the previous result or rebuilt the chain.
+* `Q` is the recovery progress (0..1, after the Recovery Curve), `REC` the
+  recovery mode number, `REFR` the share of blocks Motion refresh has
+  already refreshed, in percent.
 
 ## Build from source
 
@@ -311,6 +366,12 @@ ffmpeg -f lavfi -i "testsrc2=s=1280x720:r=30:d=1.2,crop=640:360:x='100+t*300':y=
     from.rgb to.rgb 640 360 36 out.rgb
 ffmpeg -f rawvideo -pix_fmt rgb24 -s 640x360 -r 30 -i out.rgb out.mp4
 ```
+
+Any parameter can be set after the view argument as `name=value`, e.g.
+`... out.rgb 0 recoverMode=4 recoverStart=0.4`. `MOCK_PURGE=1` drops the
+plugin's cache before every frame (like scrubbing), so the output can be
+compared with a normal sequential run; `MOCK_PARAMS=1` prints each
+parameter's group and enabled state and exits.
 
 `build/mosh_test` runs only the algorithm core on two raw clips.
 

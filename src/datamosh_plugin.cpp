@@ -24,8 +24,8 @@
 
 #define PLUGIN_ID "com.github.ofxdatamosh.Datamosh"
 #define PLUGIN_VERSION_MAJOR 1
-#define PLUGIN_VERSION_MINOR 4
-#define PLUGIN_VERSION_STRING "1.4"
+#define PLUGIN_VERSION_MINOR 5
+#define PLUGIN_VERSION_STRING "1.5"
 
 static OfxHost* gHost = nullptr;
 static OfxImageEffectSuiteV1* gEffect = nullptr;
@@ -50,11 +50,22 @@ const char* kSmooth = "smoothVectors";      // bool
 const char* kFillFlat = "fillFlat";         // bool
 const char* kRecoverStart = "recoverStart"; // double 0..1
 const char* kRecoverMode = "recoverMode";   // choice
+const char* kRecoverCurve = "recoverCurve"; // choice
+const char* kRecoverSoftness = "recoverSoftness"; // double 0..1
+const char* kRevealInvert = "revealInvert"; // bool
 const char* kMaxSteps = "maxSteps";         // int
 const char* kClamp = "clampLevels";         // bool
 const char* kSeed = "seed";                 // int
 const char* kView = "view";                 // choice: result / motion vectors / diagnostics
+
+const char* kGrpCut = "grpCut";
+const char* kGrpMosh = "grpMosh";
+const char* kGrpMotion = "grpMotion";
+const char* kGrpRecovery = "grpRecovery";
+const char* kGrpAdvanced = "grpAdvanced";
 }  // namespace P
+
+static const int kDefaultRecovery = (int)mosh::Recovery::MotionRefresh;
 
 static const int kBlockSizes[] = {8, 16, 32, 64};
 
@@ -87,13 +98,24 @@ static void hostParallelFor(int n, const mosh::RangeBody& body) {
 
 // ---------------------------------------------------------------- param helpers
 
+// Group that parameters defined next are placed in (nullptr: top level).
+static const char* gGroup = nullptr;
+
 static OfxPropertySetHandle defineParam(OfxParamSetHandle ps, const char* type, const char* name,
                                         const char* label, const char* hint) {
     OfxPropertySetHandle p = nullptr;
     gParam->paramDefine(ps, type, name, &p);
     gProp->propSetString(p, kOfxPropLabel, 0, label);
     gProp->propSetString(p, kOfxParamPropHint, 0, hint);
+    if (gGroup) gProp->propSetString(p, kOfxParamPropParent, 0, gGroup);
     return p;
+}
+
+static void beginGroup(OfxParamSetHandle ps, const char* name, const char* label, const char* hint, bool open) {
+    gGroup = nullptr;
+    OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeGroup, name, label, hint);
+    gProp->propSetInt(p, kOfxParamPropGroupOpen, 0, open ? 1 : 0);
+    gGroup = name;
 }
 
 static void defineDouble(OfxParamSetHandle ps, const char* name, const char* label, const char* hint,
@@ -317,7 +339,10 @@ struct Settings {
     bool smooth = true;
     bool fillFlat = true;
     double recoverStart = 0.8;
-    int recoverMode = 0;
+    int recoverMode = kDefaultRecovery;
+    int recoverCurve = 0;
+    float recoverSoftness = 0.5f;
+    bool revealInvert = false;
     int maxSteps = 48;
     bool clampLevels = true;
     int seed = 0;
@@ -340,7 +365,10 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.smooth = getInt(ps, P::kSmooth, t, 1) != 0;
     s.fillFlat = getInt(ps, P::kFillFlat, t, 1) != 0;
     s.recoverStart = getDouble(ps, P::kRecoverStart, t, 0.8);
-    s.recoverMode = getInt(ps, P::kRecoverMode, t, 0);
+    s.recoverMode = std::min(std::max(getInt(ps, P::kRecoverMode, t, kDefaultRecovery), 0), 5);
+    s.recoverCurve = std::min(std::max(getInt(ps, P::kRecoverCurve, t, 0), 0), 3);
+    s.recoverSoftness = (float)getDouble(ps, P::kRecoverSoftness, t, 0.5);
+    s.revealInvert = getInt(ps, P::kRevealInvert, t, 0) != 0;
     s.maxSteps = std::max(1, getInt(ps, P::kMaxSteps, t, 48));
     s.clampLevels = getInt(ps, P::kClamp, t, 1) != 0;
     s.seed = getInt(ps, P::kSeed, t, 0);
@@ -356,13 +384,19 @@ static uint64_t chainHash(const Settings& s) {
     mix((uint64_t)s.block); mix((uint64_t)s.range); mixf(s.motionScale); mixf(s.residual);
     mix((uint64_t)s.repeat); mixf(s.intraThreshold); mix(s.smooth); mix(s.fillFlat);
     mix((uint64_t)s.maxSteps); mix(s.clampLevels);
+    if ((mosh::Recovery)s.recoverMode == mosh::Recovery::MotionRefresh) {
+        // this mode recovers inside the chain
+        mix(0x5eed); mixf((float)s.recoverStart); mix((uint64_t)s.moshLength); mix((uint64_t)s.recoverCurve);
+        mixf(s.recoverSoftness); mix((uint64_t)s.seed);
+    }
     return h;
 }
 
 static float recoveryAmount(const Settings& s, double p) {
     if (p >= 1.0) return 1.f;
     if (s.recoverStart >= 1.0) return 0.f;
-    return (float)std::min(std::max((p - s.recoverStart) / (1.0 - s.recoverStart), 0.0), 1.0);
+    const float q = (float)std::min(std::max((p - s.recoverStart) / (1.0 - s.recoverStart), 0.0), 1.0);
+    return mosh::shapeCurve(q, (mosh::Curve)s.recoverCurve);
 }
 
 // ---------------------------------------------------------------- per-instance cache
@@ -380,6 +414,7 @@ struct Instance {
         double cutFrame;
         uint64_t hash;
         mosh::Image acc;
+        std::vector<uint8_t> refreshed;  // Motion refresh: blocks already refreshed
     };
     std::deque<AccEntry> accCache;  // most recent last, at most kAccEntries
 
@@ -403,23 +438,25 @@ struct Instance {
         if (pairDiff.size() > kMaxDiffs) pairDiff.clear();
         pairDiff[f] = d;
     }
-    bool getAcc(double t, double cut, uint64_t hash, mosh::Image& out) {
+    bool getAcc(double t, double cut, uint64_t hash, mosh::Image& out, std::vector<uint8_t>& refreshed) {
         std::lock_guard<std::mutex> g(m);
         for (const AccEntry& e : accCache)
             if (e.t == t && e.cutFrame == cut && e.hash == hash) {
                 out = e.acc;
+                refreshed = e.refreshed;
                 return true;
             }
         return false;
     }
-    void putAcc(double t, double cut, uint64_t hash, const mosh::Image& acc) {
+    void putAcc(double t, double cut, uint64_t hash, const mosh::Image& acc, const std::vector<uint8_t>& refreshed) {
         std::lock_guard<std::mutex> g(m);
         for (AccEntry& e : accCache)
             if (e.t == t && e.cutFrame == cut && e.hash == hash) {
                 e.acc = acc;
+                e.refreshed = refreshed;
                 return;
             }
-        accCache.push_back({t, cut, hash, acc});
+        accCache.push_back({t, cut, hash, acc, refreshed});
         while (accCache.size() > kAccEntries) accCache.pop_front();
     }
 };
@@ -618,6 +655,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(effect, &ps);
 
+    beginGroup(ps, P::kGrpCut, "Cut Detection", "Where the keyframe goes missing.", true);
     defineChoice(ps, P::kCutMode, "Cut",
                  "Where the keyframe goes missing. Auto looks back for the most recent hard cut in the clip; "
                  "Manual uses the frame below.",
@@ -629,15 +667,10 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                  "Auto mode: how different two consecutive frames must be to count as a cut. "
                  "Diagnostics shows the largest difference seen.",
                  0.12, 0.02, 1.0);
+
+    beginGroup(ps, P::kGrpMosh, "Mosh", "How the old picture is dragged and smeared.", true);
     defineInt(ps, P::kMoshLength, "Mosh Length",
               "How many frames after the cut the mosh lasts (including recovery).", 30, 2, 600);
-
-    defineChoice(ps, P::kBlockSize, "Block Size",
-                 "Macroblock size in pixels. Larger blocks look chunkier and render faster.",
-                 {"8", "16", "32", "64"}, 1);
-    defineInt(ps, P::kSearchRange, "Search Range", "Maximum motion per frame step, in pixels.", 48, 4, 256);
-    defineDouble(ps, P::kMotionScale, "Motion Scale",
-                 "Multiplies the motion vectors. Above 1 exaggerates the drag, negative inverts it.", 1.0, -4.0, 4.0);
     defineDouble(ps, P::kResidual, "Residual Strength",
                  "How much of each P-frame residual bleeds in. 0 = pure smear of the old picture, "
                  "1 = codec-accurate, higher overdrives the colours.",
@@ -646,6 +679,15 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
               "Decode every P-frame this many times, like duplicated P-frames in a hex-edited stream. "
               "Makes the picture flow further and the colours bloom.",
               1, 1, 12);
+    defineDouble(ps, P::kMotionScale, "Motion Scale",
+                 "Multiplies the motion vectors. Above 1 exaggerates the drag, negative inverts it.", 1.0, -4.0, 4.0);
+    defineBool(ps, P::kClamp, "Clamp Levels", "Keep accumulated colours inside 0..1, like an 8-bit decoder.", true);
+
+    beginGroup(ps, P::kGrpMotion, "Motion Estimation", "How motion vectors are found in the new shot.", true);
+    defineChoice(ps, P::kBlockSize, "Block Size",
+                 "Macroblock size in pixels. Larger blocks look chunkier and render faster.",
+                 {"8", "16", "32", "64"}, 1);
+    defineInt(ps, P::kSearchRange, "Search Range", "Maximum motion per frame step, in pixels.", 48, 4, 256);
     defineDouble(ps, P::kIntra, "Intra Threshold",
                  "Blocks whose motion prediction is worse than this show the new picture directly, "
                  "like intra blocks in a P-frame. 1 disables.",
@@ -654,26 +696,77 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     defineBool(ps, P::kFillFlat, "Fill Flat Areas",
                "Give textureless blocks the motion of their neighbours, as encoders do, so flat sky and walls flow too.",
                true);
+
+    beginGroup(ps, P::kGrpRecovery, "Recovery", "How the real picture of the new shot comes back.", true);
+    defineChoice(ps, P::kRecoverMode, "Recovery",
+                 "How the real picture returns. Block refresh: macroblocks come back in random order. "
+                 "Dissolve: crossfade. Hard cut: instantly. Motion refresh: blocks where the new shot moves "
+                 "come back first, inside the mosh, so the smear keeps flowing through them. Structure first: "
+                 "the shapes of the new shot appear in the smeared colours, then the colours follow. "
+                 "Luma reveal: the new shot shows through its bright areas first.",
+                 {"Block refresh", "Dissolve", "Hard cut", "Motion refresh", "Structure first", "Luma reveal"},
+                 kDefaultRecovery);
     defineDouble(ps, P::kRecoverStart, "Recovery Start",
                  "Fraction of the mosh at which the real picture starts to come back.", 0.8, 0.05, 1.0);
-    defineChoice(ps, P::kRecoverMode, "Recovery",
-                 "How the real picture returns: macroblocks refresh randomly, a dissolve, or a hard cut.",
-                 {"Block refresh", "Dissolve", "Hard cut"}, 0);
+    defineChoice(ps, P::kRecoverCurve, "Recovery Curve",
+                 "Pace of the recovery: steady, slow-fast-slow, slow start, or slow end.",
+                 {"Linear", "Smooth", "Ease in", "Ease out"}, 0);
+    defineDouble(ps, P::kRecoverSoftness, "Softness",
+                 "How gradual the recovery is. Block refresh: how long each block takes to fade in. "
+                 "Motion refresh: how long the smear lingers in refreshed blocks. Structure first: how long "
+                 "the old colours stay after the shapes arrive. Luma reveal: width of the soft edge.",
+                 0.5, 0.0, 1.0);
+    defineBool(ps, P::kRevealInvert, "Dark Areas First", "Luma reveal: reveal dark areas first instead of bright ones.",
+               false);
+    defineInt(ps, P::kSeed, "Seed", "Changes the random order of block refresh.", 0, 0, 9999);
+
+    beginGroup(ps, P::kGrpAdvanced, "Performance & Debug", "Speed limits and debug views.", true);
     defineInt(ps, P::kMaxSteps, "Max Motion Steps",
               "Upper bound on frame pairs analysed per output frame when the cache is cold. Lower is faster; "
               "motion is then sampled at a coarser stride.",
               48, 1, 240);
-    defineBool(ps, P::kClamp, "Clamp Levels", "Keep accumulated colours inside 0..1, like an 8-bit decoder.", true);
-    defineInt(ps, P::kSeed, "Seed", "Changes which blocks refresh first.", 0, 0, 9999);
     defineChoice(ps, P::kView, "View", "Debug views: the motion vectors used for the current frame, or numbers.",
                  {"Result", "Motion vectors", "Diagnostics"}, 0);
+    gGroup = nullptr;
     return kOfxStatOK;
 }
 
+// Grey out parameters that do nothing with the current choices.
+static void setEnabled(OfxParamSetHandle ps, const char* name, bool on) {
+    OfxParamHandle h = nullptr;
+    OfxPropertySetHandle props = nullptr;
+    if (gParam->paramGetHandle(ps, name, &h, &props) != kOfxStatOK || !props) return;
+    gProp->propSetInt(props, kOfxParamPropEnabled, 0, on ? 1 : 0);
+}
+
+static int currentInt(OfxParamSetHandle ps, const char* name, int fallback) {
+    OfxParamHandle h = nullptr;
+    if (gParam->paramGetHandle(ps, name, &h, nullptr) != kOfxStatOK || !h) return fallback;
+    int v = fallback;
+    gParam->paramGetValue(h, &v);
+    return v;
+}
+
+static void updateEnabled(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    if (!ps) return;
+    const bool manual = currentInt(ps, P::kCutMode, 0) == 1;
+    setEnabled(ps, P::kCutFrame, manual);
+    setEnabled(ps, P::kCutThreshold, !manual);
+    const auto mode = (mosh::Recovery)currentInt(ps, P::kRecoverMode, kDefaultRecovery);
+    const bool soft = mode == mosh::Recovery::Blocks || mode == mosh::Recovery::MotionRefresh ||
+                      mode == mosh::Recovery::StructureFirst || mode == mosh::Recovery::LumaReveal;
+    setEnabled(ps, P::kRecoverSoftness, soft);
+    setEnabled(ps, P::kRevealInvert, mode == mosh::Recovery::LumaReveal);
+    setEnabled(ps, P::kSeed, mode == mosh::Recovery::Blocks || mode == mosh::Recovery::MotionRefresh);
+    setEnabled(ps, P::kRecoverCurve, mode != mosh::Recovery::HardCut);
+}
 static OfxStatus createInstance(OfxImageEffectHandle inst) {
     OfxPropertySetHandle props = nullptr;
     gEffect->getPropertySet(inst, &props);
     if (props) gProp->propSetPointer(props, kOfxPropInstanceData, 0, new Instance());
+    updateEnabled(inst);
     return kOfxStatOK;
 }
 
@@ -750,12 +843,18 @@ struct ChainResult {
     float firstPairDiff = -1.f;
     int stepsDone = 0;
     bool fromCache = false;
+    std::vector<uint8_t> refreshed;  // Motion refresh state, carried along the chain
 };
 
 // Runs motion steps over frames `times` on top of acc.
-static void runSteps(OfxImageEffectHandle inst, OfxImageClipHandle src, const Settings& s,
+static void runSteps(OfxImageEffectHandle inst, OfxImageClipHandle src, const Plan& pl,
                      const std::vector<double>& times, mosh::Image& acc, ChainResult& cr,
                      const mosh::ParallelFor& pf) {
+    const Settings& s = pl.s;
+    const bool refresh = (mosh::Recovery)s.recoverMode == mosh::Recovery::MotionRefresh;
+    mosh::RefreshStep rs;
+    rs.softness = s.recoverSoftness;
+    rs.seed = s.seed;
     mosh::StepParams sp;
     sp.motionScale = s.motionScale;
     sp.residual = s.residual;
@@ -773,6 +872,10 @@ static void runSteps(OfxImageEffectHandle inst, OfxImageClipHandle src, const Se
         if (i == 1) cr.firstPairDiff = meanAbsDiff(prev, cur);
         cr.lastField = mosh::estimateMotion(prev, cur, mp, pf);
         mosh::moshStep(prev, cur, cr.lastField, sp, acc, scratch, pf);
+        if (refresh) {
+            rs.q = recoveryAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
+            mosh::refreshStep(prev, cur, cr.lastField, rs, cr.refreshed, acc, pf);
+        }
         std::swap(prev, cur);
         ++cr.stepsDone;
     }
@@ -801,7 +904,11 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
     line("N " + fmt("%.0f", pl.nFrames) + "  STEPS " + fmt("%.0f", pl.steps) + "  DONE " + fmt("%.0f", cr.stepsDone) +
          (cr.fromCache ? "  CACHED" : "  FULL"));
     line("PAIR DIFF " + fmt("%.4f", cr.firstPairDiff));
-    line("MV " + fmt("%.2f", mv) + " PX  INTRA " + fmt("%.0f", intra) + "  Q " + fmt("%.2f", pl.q));
+    line("MV " + fmt("%.2f", mv) + " PX  INTRA " + fmt("%.0f", intra) + "  Q " + fmt("%.2f", pl.q) +
+         "  REC " + fmt("%.0f", pl.s.recoverMode) +
+         ((mosh::Recovery)pl.s.recoverMode == mosh::Recovery::MotionRefresh
+              ? "  REFR " + fmt("%.0f", 100.0 * mosh::refreshedShare(cr.refreshed))
+              : std::string()));
     line("IMG " + fmt("%.0f", outW) + "X" + fmt("%.0f", outH) + "  BLK " + fmt("%.0f", pl.s.block));
 }
 
@@ -840,15 +947,15 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         // Fast path: the previous frame's accumulated picture is cached and the
         // chain is unstrided, so one more step gives exactly the same result.
         const bool unstrided = pl.steps == pl.nFrames;
-        if (unstrided && pl.nFrames >= 1 && cache && cache->getAcc(t - 1.0, pl.cutFrame, hash, acc)) {
+        if (unstrided && pl.nFrames >= 1 && cache && cache->getAcc(t - 1.0, pl.cutFrame, hash, acc, cr.refreshed)) {
             cr.fromCache = true;
-            runSteps(inst, src, s, {t - 1.0, t}, acc, cr, pf);
+            runSteps(inst, src, pl, {t - 1.0, t}, acc, cr, pf);
         } else {
             // Reference picture: the last frame before the cut, the one the decoder is stuck with.
             if (!fetchAsImage(src, pl.cutFrame - 1.0, acc) && !fetchAsImage(src, t, acc)) return kOfxStatFailed;
-            runSteps(inst, src, s, pl.times, acc, cr, pf);
+            runSteps(inst, src, pl, pl.times, acc, cr, pf);
         }
-        if (cache && unstrided) cache->putAcc(t, pl.cutFrame, hash, acc);
+        if (cache && unstrided) cache->putAcc(t, pl.cutFrame, hash, acc, cr.refreshed);
     } else if (!fetchAsImage(src, t, acc)) {
         return kOfxStatFailed;
     }
@@ -871,7 +978,13 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     if (!pl.passThrough && pl.q > 0.f) {
         mosh::Image to;
         if (!fetchAsImage(src, t, to)) return kOfxStatFailed;
-        mosh::compose(acc, to, (mosh::Recovery)s.recoverMode, pl.q, s.block, s.seed, result, pf);
+        mosh::ComposeParams cp;
+        cp.mode = (mosh::Recovery)s.recoverMode;
+        cp.softness = s.recoverSoftness;
+        cp.block = s.block;
+        cp.seed = s.seed;
+        cp.invertReveal = s.revealInvert;
+        mosh::compose(acc, to, cp, pl.q, result, pf);
     } else {
         result = std::move(acc);
     }
@@ -895,6 +1008,7 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
         if (!strcmp(action, kOfxActionInstanceChanged) || !strcmp(action, kOfxActionPurgeCaches) ||
             !strcmp(action, kOfxActionSyncPrivateData)) {
             if (Instance* d = instanceData(effect)) d->clear();
+            if (!strcmp(action, kOfxActionInstanceChanged)) updateEnabled(effect);
             return kOfxStatOK;
         }
         if (!strcmp(action, kOfxImageEffectActionGetClipPreferences)) return getClipPreferences(effect, outArgs);

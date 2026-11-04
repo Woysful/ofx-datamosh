@@ -104,7 +104,12 @@ int main(int argc, char** argv) {
                     mag / nb, 100.0 * intra / nb);
         }
         const float q = p < recoverStart ? 0.f : (float)((p - recoverStart) / (1.0 - recoverStart));
-        mosh::compose(acc, to[i], mosh::Recovery::Blocks, q, mp.block, 7, result, threadedFor);
+        mosh::ComposeParams cp;
+        cp.mode = mosh::Recovery::Blocks;
+        cp.softness = 0.f;
+        cp.block = mp.block;
+        cp.seed = 7;
+        mosh::compose(acc, to[i], cp, q, result, threadedFor);
         writeFrame(out, result);
         if (vec) {
             mosh::visualizeMotion(mf, mp.range, w, h, result, threadedFor);
