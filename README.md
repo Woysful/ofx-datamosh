@@ -181,16 +181,30 @@ ships.
 
 **Release archives for every platform**
 
-`build-all.sh` builds every platform the machine has a toolchain for and
-writes `dist/ofx-datamosh-<version>-<platform>.zip` (bundle, README, LICENSE,
+`build.sh` builds every platform the machine has a toolchain for and writes
+`dist/ofx-datamosh-<version>-<platform>.zip` (bundle, README, LICENSE,
 install scripts). The version is the git tag on the current commit, or the
 version from `packaging/Info.plist`.
 
 ```sh
-./build-all.sh                 # linux, windows, macos: whatever is available
-./build-all.sh linux windows   # only these
+./build.sh --list              # which platforms can be built on this machine
+./build.sh                     # all of them; the rest are skipped
+./build.sh linux windows       # only these (fails if one cannot be built)
+./build.sh -c -q -v v1.5.0     # clean, quiet build labelled v1.5.0
+./build.sh --help              # all options
 ```
 
+| Option | Meaning |
+|---|---|
+| `-h`, `--help` | show usage |
+| `-l`, `--list` | show which platforms can be built here and how |
+| `-v`, `--version VER` | version label in archive names |
+| `-o`, `--output DIR` | output directory (default `dist`) |
+| `-j`, `--jobs N` | parallel compile jobs |
+| `-c`, `--clean` | delete `build-release/` and the output directory first |
+| `-n`, `--no-zip` | only build bundles, left in `build-release/<platform>/` |
+| `-q`, `--quiet` | hide compiler output, keep it in `build-release/<platform>.log` |
+| `--debug` | debug build |
 | Platform | How it is built | What you need |
 |---|---|---|
 | linux | native, on Linux (x86_64 or arm64) | g++ or clang |
@@ -228,7 +242,7 @@ tools/mosh_test.cpp      offline harness for the core
 tools/mock_host.cpp      minimal OpenFX host for end-to-end plugin tests
 packaging/Info.plist     bundle metadata
 install.sh / install.ps1 copy the built bundle into the system plugin directory
-build-all.sh             release archives for Linux, Windows and macOS into dist/
+build.sh                 release archives for Linux, Windows and macOS into dist/
 cmake/                   toolchain files for MinGW-w64 and osxcross cross builds
 ```
 
