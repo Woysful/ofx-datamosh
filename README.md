@@ -34,7 +34,7 @@ same thing in software, per frame:
 
 Grab the archive for your OS from the
 [latest release](../../releases/latest) and unpack it. (If your OS has no
-archive in the release yet, build from source, see below.) Inside is
+archive in the release, build from source, see below.) Inside is
 `Datamosh.ofx.bundle`. Copy the whole bundle folder into the system OpenFX
 plugin directory, then restart the host.
 
@@ -179,6 +179,28 @@ The bundle lands in `build/Datamosh.ofx.bundle/`. On Linux the C++ runtime
 is linked statically so the plugin does not clash with the libraries Resolve
 ships.
 
+**Release archives for every platform**
+
+`build-all.sh` builds every platform the machine has a toolchain for and
+writes `dist/ofx-datamosh-<version>-<platform>.zip` (bundle, README, LICENSE,
+install scripts). The version is the git tag on the current commit, or the
+version from `packaging/Info.plist`.
+
+```sh
+./build-all.sh                 # linux, windows, macos: whatever is available
+./build-all.sh linux windows   # only these
+```
+
+| Platform | How it is built | What you need |
+|---|---|---|
+| linux | native, on Linux (x86_64 or arm64) | g++ or clang |
+| windows | MinGW-w64 cross compiler on Linux/macOS, or natively in Git Bash / MSYS2 on Windows | `g++-mingw-w64-x86-64-posix` (Debian/Ubuntu), `mingw64-gcc-c++` (Fedora), `mingw-w64-gcc` (Arch), `mingw-w64` (Homebrew) |
+| macos | natively on a Mac (universal arm64 + x86_64), or with [osxcross](https://github.com/tpoechtrager/osxcross) on Linux | Xcode command line tools, or osxcross `target/bin` on `PATH` |
+
+Platforms without a toolchain are skipped with a message. To publish, attach
+the files from `dist/` to a GitHub release, e.g.
+`gh release create v1.5.0 dist/*.zip`.
+
 ## Test tools
 
 `build/mock_host` (Linux/macOS) is a tiny OpenFX host that loads the built
@@ -206,8 +228,8 @@ tools/mosh_test.cpp      offline harness for the core
 tools/mock_host.cpp      minimal OpenFX host for end-to-end plugin tests
 packaging/Info.plist     bundle metadata
 install.sh / install.ps1 copy the built bundle into the system plugin directory
-ci/build.yml             GitHub Actions workflow for Linux, Windows and macOS builds;
-                         copy to .github/workflows/ to enable it (tags publish a release)
+build-all.sh             release archives for Linux, Windows and macOS into dist/
+cmake/                   toolchain files for MinGW-w64 and osxcross cross builds
 ```
 
 ## License

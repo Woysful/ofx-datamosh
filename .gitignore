@@ -1,4 +1,6 @@
 build/
 build-*/
+dist/
+stage/
 third_party/openfx/
 *.rgb

@@ -1,0 +1,15 @@
+# Cross-compile for macOS from Linux with osxcross (https://github.com/tpoechtrager/osxcross).
+# Pass -DOSX_ARCH=x86_64 or -DOSX_ARCH=arm64; build-all.sh builds both and merges them with lipo.
+set(CMAKE_SYSTEM_NAME Darwin)
+set(OSX_ARCH x86_64 CACHE STRING "Target architecture (x86_64 or arm64)")
+if(OSX_ARCH STREQUAL "arm64")
+  set(CMAKE_SYSTEM_PROCESSOR arm64)
+  find_program(CMAKE_CXX_COMPILER NAMES oa64-clang++ REQUIRED)
+else()
+  set(CMAKE_SYSTEM_PROCESSOR x86_64)
+  find_program(CMAKE_CXX_COMPILER NAMES o64-clang++ REQUIRED)
+endif()
+set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
