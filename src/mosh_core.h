@@ -335,8 +335,22 @@ inline void moshStep(const Image& prev, const Image& cur, const MotionField& mf,
     }
 }
 
-enum class Recovery { Blocks = 0, Dissolve = 1, HardCut = 2, MotionRefresh = 3, StructureFirst = 4, LumaReveal = 5 };
+enum class Recovery {
+    Blocks = 0,
+    Dissolve = 1,
+    HardCut = 2,
+    MotionRefresh = 3,
+    StructureFirst = 4,
+    LumaReveal = 5,
+    ColourFirst = 6,
+    Settle = 7,
+    Wipe = 8,
+    Slice = 9,
+};
+static const int kRecoveryCount = 10;
 enum class Curve { Linear = 0, Smooth = 1, EaseIn = 2, EaseOut = 3 };
+enum class Direction { LeftToRight = 0, RightToLeft = 1, TopToBottom = 2, BottomToTop = 3, FromCentre = 4, ToCentre = 5 };
+static const int kDirectionCount = 6;
 
 inline float clamp01(float v) { return std::min(std::max(v, 0.f), 1.f); }
 inline float smoothstep01(float v) {
@@ -499,7 +513,64 @@ struct ComposeParams {
     int block = 16;
     int seed = 0;
     bool invertReveal = false;  // Luma reveal: dark areas first
+    Direction direction = Direction::LeftToRight;  // Wipe, Slice
 };
+
+// Position of (x,y) along a wipe in direction d, 0 = reached first.
+inline float wipeCoord(Direction d, int x, int y, int w, int h) {
+    const float u = (float(x) + 0.5f) / float(std::max(1, w));
+    const float v = (float(y) + 0.5f) / float(std::max(1, h));
+    switch (d) {
+        case Direction::RightToLeft: return 1.f - u;
+        case Direction::TopToBottom: return v;
+        case Direction::BottomToTop: return 1.f - v;
+        case Direction::FromCentre:
+        case Direction::ToCentre: {
+            const float ax = (u - 0.5f) * float(w), ay = (v - 0.5f) * float(h);
+            const float r = std::sqrt(ax * ax + ay * ay) / (0.5f * std::sqrt(float(w) * w + float(h) * h));
+            return d == Direction::FromCentre ? clamp01(r) : 1.f - clamp01(r);
+        }
+        default: return u;
+    }
+}
+
+// Slice: the frame is cut into bands of 1-4 macroblocks (rows for
+// horizontal directions, columns for vertical ones); every band slides in
+// on its own schedule.
+struct SliceLayout {
+    bool columns = false;
+    std::vector<int> band;      // band index per row (or column) of pixels
+    std::vector<float> start;   // start time per band
+    std::vector<int> sign;      // +1 slides towards +x/+y, -1 the other way
+    float dur = 0.5f;
+};
+
+inline SliceLayout makeSlices(const ComposeParams& cp, int w, int h, float s) {
+    SliceLayout L;
+    L.columns = cp.direction == Direction::TopToBottom || cp.direction == Direction::BottomToTop;
+    const int n = L.columns ? w : h;
+    const int block = std::max(1, cp.block);
+    L.band.assign(n, 0);
+    L.dur = 0.15f + 0.6f * s;
+    int b = 0, pos = 0;
+    while (pos < n) {
+        const int len = block * (1 + int(blockHash(b, 7, cp.seed + 31) * 4.f));
+        for (int i = pos; i < std::min(n, pos + len); ++i) L.band[i] = b;
+        L.start.push_back(blockHash(b, 3, cp.seed + 17) * (1.f - L.dur));
+        int sg = 1;
+        switch (cp.direction) {
+            case Direction::RightToLeft:
+            case Direction::BottomToTop: sg = -1; break;
+            case Direction::FromCentre:
+            case Direction::ToCentre: sg = (b & 1) ? -1 : 1; break;
+            default: break;
+        }
+        L.sign.push_back(sg);
+        pos += len;
+        ++b;
+    }
+    return L;
+}
 
 // Bring the real incoming picture back over the moshed one. q in [0,1] is
 // recovery progress (already shaped by the recovery curve).
@@ -512,6 +583,13 @@ struct ComposeParams {
 //   StructureFirst: the edges and texture of the new shot appear first,
 //                   painted with the smeared colours; the colours follow.
 //   LumaReveal:     the new shot shows through its bright areas first.
+//   ColourFirst:    the colours of the new shot wash in first under the
+//                   smeared detail; the detail follows.
+//   Settle:         areas where the mosh is already close to the new shot
+//                   settle first, the worst mismatches last.
+//   Wipe:           a wipe with a ragged, macroblock-sized edge.
+//   Slice:          bands of macroblocks slide the new shot in and push the
+//                   mosh out, each band on its own schedule.
 inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, float q, Image& out,
                     const ParallelFor& pf) {
     out.resize(to.w, to.h);
@@ -519,14 +597,19 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
     const float s = clamp01(cp.softness);
     const int block = std::max(1, cp.block);
 
-    if (cp.mode == Recovery::StructureFirst) {
-        const int r = std::max(3, block);
+    if (cp.mode == Recovery::StructureFirst || cp.mode == Recovery::ColourFirst) {
+        const bool colourFirst = cp.mode == Recovery::ColourFirst;
+        // A wider blur for Colour first so the colours arrive as a wash
+        // rather than as a blurry copy of the new shot.
+        const int r = colourFirst ? std::max(6, 2 * block) : std::max(3, block);
         Image lowA, lowT;
         boxBlur(acc, r, lowA, pf);
         boxBlur(to, r, lowT, pf);
-        const float lag = 0.1f + 0.5f * s;  // colours start when structure is this far in
-        const float kd = smoothstep01(q / (1.f - lag));
-        const float kc = smoothstep01((q - lag) / (1.f - lag));
+        const float lag = 0.1f + 0.5f * s;  // the second layer starts when the first is this far in
+        const float kFirst = smoothstep01(q / (1.f - lag));
+        const float kSecond = smoothstep01((q - lag) / (1.f - lag));
+        const float kd = colourFirst ? kSecond : kFirst;  // detail
+        const float kc = colourFirst ? kFirst : kSecond;  // colour
         pf(to.h, [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y)
                 for (int x = 0; x < to.w; ++x) {
@@ -545,11 +628,61 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
         return;
     }
 
+    if (cp.mode == Recovery::Slice) {
+        const SliceLayout L = makeSlices(cp, to.w, to.h, s);
+        pf(to.h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < to.w; ++x) {
+                    const int b = L.band[L.columns ? x : y];
+                    const int n = L.columns ? to.h : to.w;
+                    const int pos = L.columns ? y : x;
+                    const float lp = q >= 1.f ? 1.f : smoothstep01((q - L.start[b]) / L.dur);
+                    const int e = (int)std::lround(lp * float(n));  // how far the new shot is in
+                    // Position in the band's own frame, measured from the edge it enters at.
+                    const int p = L.sign[b] > 0 ? pos : n - 1 - pos;
+                    const bool in = p < e;
+                    const int shift = in ? (n - e) : -e;  // new shot trails the edge, mosh is pushed ahead
+                    const int sp = pos + (L.sign[b] > 0 ? shift : -shift);
+                    const float* c = in ? (L.columns ? to.clampedAt(x, sp) : to.clampedAt(sp, y))
+                                        : (L.columns ? acc.clampedAt(x, sp) : acc.clampedAt(sp, y));
+                    float* o = out.at(x, y);
+                    for (int ch = 0; ch < 4; ++ch) o[ch] = c[ch];
+                }
+        });
+        return;
+    }
+
     Image key;
+    float keyNorm = 1.f;
     if (cp.mode == Recovery::LumaReveal) boxBlur(to, std::max(2, block / 2), key, pf);
+    if (cp.mode == Recovery::Settle) {
+        Image diff(to.w, to.h);
+        pf(to.h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < to.w; ++x) {
+                    const float* a = acc.at(x, y);
+                    const float* t = to.at(x, y);
+                    diff.at(x, y)[0] =
+                        (std::fabs(a[0] - t[0]) + std::fabs(a[1] - t[1]) + std::fabs(a[2] - t[2])) / 3.f;
+                }
+        });
+        boxBlur(diff, std::max(2, block / 2), key, pf);
+        // Normalise by a high percentile so a few extreme pixels do not
+        // squash everything else into "already settled".
+        std::vector<float> sample;
+        sample.reserve(key.px.size() / 16 + 1);
+        for (size_t i = 0; i < key.px.size(); i += 16) sample.push_back(key.px[i]);
+        if (!sample.empty()) {
+            const size_t k = sample.size() * 95 / 100;
+            std::nth_element(sample.begin(), sample.begin() + k, sample.end());
+            keyNorm = sample[k] > 1e-4f ? 1.f / sample[k] : 1.f;
+        }
+    }
 
     const float bw = 0.6f * s;           // Blocks: fade window per block
-    const float fw = 0.05f + 0.6f * s;   // LumaReveal: soft edge width
+    const float fw = 0.05f + 0.6f * s;   // LumaReveal, Settle: soft edge width
+    const float ww = 0.02f + 0.4f * s;   // Wipe: soft edge width
+    const float jag = 0.08f;             // Wipe: per-block raggedness of the edge
     pf(to.h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             for (int x = 0; x < to.w; ++x) {
@@ -574,14 +707,25 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
                         k = smoothstep01((q * (1.f + fw) - (1.f - l)) / fw);
                         break;
                     }
+                    case Recovery::Settle: {
+                        const float d = clamp01(key.at(x, y)[0] * keyNorm);
+                        k = smoothstep01((q * (1.f + fw) - d) / fw);
+                        break;
+                    }
+                    case Recovery::Wipe: {
+                        const float u = wipeCoord(cp.direction, x, y, to.w, to.h);
+                        const float h = blockHash(x / block, y / block, cp.seed + 59);
+                        const float pos = (u + jag * h) / (1.f + jag);
+                        k = smoothstep01((q * (1.f + ww) - pos) / ww);
+                        break;
+                    }
                     default: k = q > 0.f ? 1.f : 0.f; break;
                 }
                 for (int ch = 0; ch < 4; ++ch) o[ch] = a[ch] + k * (t[ch] - a[ch]);
             }
         }
     });
-}
-// Debug view: direction as colour (x -> red, y -> green), intra blocks white.
+}// Debug view: direction as colour (x -> red, y -> green), intra blocks white.
 inline void visualizeMotion(const MotionField& mf, int range, int w, int h, Image& out, const ParallelFor& pf) {
     out.resize(w, h);
     const float s = 0.5f / float(std::max(1, range));

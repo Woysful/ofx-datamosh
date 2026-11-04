@@ -213,7 +213,8 @@ Dark Areas First outside Luma reveal, and so on).
 | Recovery Curve | Linear | Pace of the recovery: Linear, Smooth (slow-fast-slow), Ease in (slow start), Ease out (slow end). |
 | Softness | 0.5 | How gradual the recovery is; what exactly it softens depends on the mode, see below. |
 | Dark Areas First | off | Luma reveal only: reveal dark areas first. |
-| Seed | 0 | Random order of Block refresh and Motion refresh. |
+| Direction | Left to right | Wipe and Slice only: where the new shot comes in from (left, right, top, bottom, from the centre, to the centre). |
+| Seed | 0 | Random order of Block refresh and Motion refresh, the ragged Wipe edge and the Slice bands. |
 
 **Performance & Debug**
 
@@ -233,7 +234,11 @@ Softness 0.5.*
 |---|---|---|
 | Motion refresh | The stream recovers inside the mosh, like an intra-refresh encoder. Regions where the new shot moves or changes come back first, whole areas at a time; static areas stay moshed longest. Refreshed blocks keep being decoded as P-blocks, so the smear around them keeps flowing in until it washes out. | how long the smear lingers in refreshed blocks |
 | Structure first | The shapes and texture of the new shot appear first, painted with the smeared colours of the old one; then the colours follow. The smoothest, most "one picture turning into another" option. | how long the old colours stay after the shapes arrive |
+| Colour first | The reverse of Structure first: the colours of the new shot wash in under the smeared detail of the old one, then the detail follows. | how long the smeared detail stays after the colours arrive |
+| Settle | Areas where the mosh already looks like the new shot settle first; the worst mismatches stay moshed longest. | width of the soft edge |
 | Luma reveal | The new shot shows through its bright areas first (or dark ones, with Dark Areas First). | width of the soft edge |
+| Wipe | A wipe in the chosen Direction, with a ragged edge one macroblock deep. | width of the soft edge |
+| Slice | The frame is cut into bands 1-4 macroblocks tall (or wide, for top/bottom directions). Each band slides the new shot in and pushes the mosh out, on its own schedule. With the centre directions neighbouring bands slide in opposite ways. | how long each band takes to slide in |
 | Block refresh | Macroblocks come back in random order. | how long each block takes to fade in (0 = they pop) |
 | Dissolve | Crossfade from the moshed picture to the real one. | - |
 | Hard cut | The real picture as soon as recovery starts. | - |
@@ -250,6 +255,8 @@ Looks to start from:
 * Pure liquid smear of the old picture, no new colours: Residual 0,
   Intra Threshold 1.
 * Short glitch: Mosh Length 12, Recovery Start 0.6, Recovery Hard cut.
+* Glitchy hand-off: Recovery Slice, Softness 0.2-0.4, Block Size 32.
+
 ## Reading the Diagnostics view
 
 Set **View** to **Diagnostics** on a frame just after the cut:

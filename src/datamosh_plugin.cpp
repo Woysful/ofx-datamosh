@@ -53,6 +53,7 @@ const char* kRecoverMode = "recoverMode";   // choice
 const char* kRecoverCurve = "recoverCurve"; // choice
 const char* kRecoverSoftness = "recoverSoftness"; // double 0..1
 const char* kRevealInvert = "revealInvert"; // bool
+const char* kDirection = "recoverDirection"; // choice: Wipe / Slice direction
 const char* kMaxSteps = "maxSteps";         // int
 const char* kClamp = "clampLevels";         // bool
 const char* kSeed = "seed";                 // int
@@ -343,6 +344,7 @@ struct Settings {
     int recoverCurve = 0;
     float recoverSoftness = 0.5f;
     bool revealInvert = false;
+    int direction = 0;
     int maxSteps = 48;
     bool clampLevels = true;
     int seed = 0;
@@ -365,10 +367,12 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.smooth = getInt(ps, P::kSmooth, t, 1) != 0;
     s.fillFlat = getInt(ps, P::kFillFlat, t, 1) != 0;
     s.recoverStart = getDouble(ps, P::kRecoverStart, t, 0.8);
-    s.recoverMode = std::min(std::max(getInt(ps, P::kRecoverMode, t, kDefaultRecovery), 0), 5);
+    s.recoverMode = std::min(std::max(getInt(ps, P::kRecoverMode, t, kDefaultRecovery), 0),
+                             mosh::kRecoveryCount - 1);
     s.recoverCurve = std::min(std::max(getInt(ps, P::kRecoverCurve, t, 0), 0), 3);
     s.recoverSoftness = (float)getDouble(ps, P::kRecoverSoftness, t, 0.5);
     s.revealInvert = getInt(ps, P::kRevealInvert, t, 0) != 0;
+    s.direction = std::min(std::max(getInt(ps, P::kDirection, t, 0), 0), mosh::kDirectionCount - 1);
     s.maxSteps = std::max(1, getInt(ps, P::kMaxSteps, t, 48));
     s.clampLevels = getInt(ps, P::kClamp, t, 1) != 0;
     s.seed = getInt(ps, P::kSeed, t, 0);
@@ -703,8 +707,13 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                  "Dissolve: crossfade. Hard cut: instantly. Motion refresh: blocks where the new shot moves "
                  "come back first, inside the mosh, so the smear keeps flowing through them. Structure first: "
                  "the shapes of the new shot appear in the smeared colours, then the colours follow. "
-                 "Luma reveal: the new shot shows through its bright areas first.",
-                 {"Block refresh", "Dissolve", "Hard cut", "Motion refresh", "Structure first", "Luma reveal"},
+                 "Luma reveal: the new shot shows through its bright areas first. Colour first: the colours "
+                 "of the new shot wash in under the smear, then the detail follows. Settle: areas where the "
+                 "mosh is already close to the new shot settle first, the worst mismatches last. Wipe: a wipe "
+                 "with a ragged macroblock edge. Slice: bands of macroblocks slide the new shot in and push "
+                 "the mosh out.",
+                 {"Block refresh", "Dissolve", "Hard cut", "Motion refresh", "Structure first", "Luma reveal",
+                  "Colour first", "Settle", "Wipe", "Slice"},
                  kDefaultRecovery);
     defineDouble(ps, P::kRecoverStart, "Recovery Start",
                  "Fraction of the mosh at which the real picture starts to come back.", 0.8, 0.05, 1.0);
@@ -714,11 +723,18 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     defineDouble(ps, P::kRecoverSoftness, "Softness",
                  "How gradual the recovery is. Block refresh: how long each block takes to fade in. "
                  "Motion refresh: how long the smear lingers in refreshed blocks. Structure first: how long "
-                 "the old colours stay after the shapes arrive. Luma reveal: width of the soft edge.",
+                 "the old colours stay after the shapes arrive. Colour first: how long the smeared detail "
+                 "stays after the colours arrive. Luma reveal, Settle, Wipe: width of the soft edge. "
+                 "Slice: how long each band takes to slide in.",
                  0.5, 0.0, 1.0);
     defineBool(ps, P::kRevealInvert, "Dark Areas First", "Luma reveal: reveal dark areas first instead of bright ones.",
                false);
-    defineInt(ps, P::kSeed, "Seed", "Changes the random order of block refresh.", 0, 0, 9999);
+    defineChoice(ps, P::kDirection, "Direction",
+                 "Wipe and Slice: where the new shot comes in from. Slice uses rows for left/right and "
+                 "columns for top/bottom; the centre options make neighbouring rows slide in opposite ways.",
+                 {"Left to right", "Right to left", "Top to bottom", "Bottom to top", "From centre", "To centre"},
+                 0);
+    defineInt(ps, P::kSeed, "Seed", "Changes the random order of block refresh, wipe edge and slices.", 0, 0, 9999);
 
     beginGroup(ps, P::kGrpAdvanced, "Performance & Debug", "Speed limits and debug views.", true);
     defineInt(ps, P::kMaxSteps, "Max Motion Steps",
@@ -755,11 +771,12 @@ static void updateEnabled(OfxImageEffectHandle inst) {
     setEnabled(ps, P::kCutFrame, manual);
     setEnabled(ps, P::kCutThreshold, !manual);
     const auto mode = (mosh::Recovery)currentInt(ps, P::kRecoverMode, kDefaultRecovery);
-    const bool soft = mode == mosh::Recovery::Blocks || mode == mosh::Recovery::MotionRefresh ||
-                      mode == mosh::Recovery::StructureFirst || mode == mosh::Recovery::LumaReveal;
+    const bool soft = mode != mosh::Recovery::Dissolve && mode != mosh::Recovery::HardCut;
+    const bool directional = mode == mosh::Recovery::Wipe || mode == mosh::Recovery::Slice;
     setEnabled(ps, P::kRecoverSoftness, soft);
     setEnabled(ps, P::kRevealInvert, mode == mosh::Recovery::LumaReveal);
-    setEnabled(ps, P::kSeed, mode == mosh::Recovery::Blocks || mode == mosh::Recovery::MotionRefresh);
+    setEnabled(ps, P::kDirection, directional);
+    setEnabled(ps, P::kSeed, mode == mosh::Recovery::Blocks || mode == mosh::Recovery::MotionRefresh || directional);
     setEnabled(ps, P::kRecoverCurve, mode != mosh::Recovery::HardCut);
 }
 static OfxStatus createInstance(OfxImageEffectHandle inst) {
@@ -984,6 +1001,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         cp.block = s.block;
         cp.seed = s.seed;
         cp.invertReveal = s.revealInvert;
+        cp.direction = (mosh::Direction)s.direction;
         mosh::compose(acc, to, cp, pl.q, result, pf);
     } else {
         result = std::move(acc);
