@@ -71,7 +71,12 @@ sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/Datamosh.ofx.bundle
 ```
 
 If you built from source, `install.sh` (Linux/macOS) or `install.ps1`
-(Windows) does the same with the bundle in `build/`.
+(Windows) does the same. Without arguments they pick the newest build for
+the current OS from the unpacked archive next to them, `build-release/`,
+`build/` or the archives in `dist/`, and refuse bundles built for another OS.
+You can also pass a bundle or a zip: `sudo ./install.sh dist/ofx-datamosh-v1.4-linux-x86_64.zip`,
+`.\install.ps1 -Path <bundle-or-zip>`. Both take a target directory
+(`--dest DIR` / `-Dest DIR`) and show help with `--help` / `Get-Help .\install.ps1`.
 
 ## Using it in DaVinci Resolve
 
@@ -155,6 +160,12 @@ the OpenFX headers are fetched into `third_party/`.
 git clone https://github.com/Woysful/ofx-datamosh.git
 cd ofx-datamosh
 git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git third_party/openfx
+./build.sh --install            # build for this OS and install (asks for sudo)
+```
+
+Or with plain CMake:
+
+```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 sudo ./install.sh
@@ -191,6 +202,7 @@ version from `packaging/Info.plist`.
 ./build.sh                     # all of them; the rest are skipped
 ./build.sh linux windows       # only these (fails if one cannot be built)
 ./build.sh -c -q -v v1.5.0     # clean, quiet build labelled v1.5.0
+./build.sh -i linux            # build for Linux and install it
 ./build.sh --help              # all options
 ```
 
@@ -205,6 +217,9 @@ version from `packaging/Info.plist`.
 | `-n`, `--no-zip` | only build bundles, left in `build-release/<platform>/` |
 | `-q`, `--quiet` | hide compiler output, keep it in `build-release/<platform>.log` |
 | `--debug` | debug build |
+| `-i`, `--install` | install the build for this OS afterwards (uses sudo if needed) |
+| `--install-dir DIR` | install into DIR instead of the system plugin directory (implies `--install`) |
+
 | Platform | How it is built | What you need |
 |---|---|---|
 | linux | native, on Linux (x86_64 or arm64) | g++ or clang |

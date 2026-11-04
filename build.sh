@@ -35,6 +35,11 @@ Options:
   -n, --no-zip         only build the bundles, leave them in build-release/<platform>/
   -q, --quiet          hide compiler output (kept in build-release/<platform>.log)
       --debug          debug build instead of release
+  -i, --install        install the plugin for this OS after building
+                       (asks for sudo / needs an elevated shell when required)
+      --install-dir DIR
+                       install into DIR instead of the system OpenFX directory
+                       (implies --install)
 
 Environment variables VERSION and JOBS work as defaults for -v and -j.
 
@@ -42,6 +47,7 @@ Examples:
   ./build.sh                     # everything available
   ./build.sh linux windows       # only these two
   ./build.sh -c -v v1.5.0        # clean release build labelled v1.5.0
+  ./build.sh -i linux            # build for Linux and install it
   gh release create v1.5.0 dist/*.zip
 USAGE
 }
@@ -92,7 +98,7 @@ list_platforms() {
 VERSION="${VERSION:-}"
 JOBS="${JOBS:-}"
 DIST="$ROOT/dist"
-CLEAN=0; ZIP=1; QUIET=0; BUILD_TYPE=Release
+CLEAN=0; ZIP=1; QUIET=0; BUILD_TYPE=Release; INSTALL=0; INSTALL_DIR=""
 TARGETS=""; EXPLICIT=0
 
 need_arg() { if [ "$#" -lt 2 ] || [ -z "$2" ]; then die "$1 needs a value"; fi; }
@@ -110,6 +116,9 @@ while [ "$#" -gt 0 ]; do
     -n|--no-zip)  ZIP=0 ;;
     -q|--quiet)   QUIET=1 ;;
     --debug)      BUILD_TYPE=Debug ;;
+    -i|--install) INSTALL=1 ;;
+    --install-dir) need_arg "$@"; INSTALL=1; INSTALL_DIR="$2"; shift ;;
+    --install-dir=*) INSTALL=1; INSTALL_DIR="${1#*=}" ;;
     all)          TARGETS="$TARGETS $PLATFORMS"; EXPLICIT=1 ;;
     linux|windows|macos) TARGETS="$TARGETS $1"; EXPLICIT=1 ;;
     -*)           die "unknown option: $1 (see --help)" ;;
@@ -125,6 +134,20 @@ case "$JOBS" in
 esac
 
 have cmake || die "cmake is required"
+
+case "$HOST_OS" in
+  Linux)   NATIVE=linux ;;
+  Darwin)  NATIVE=macos ;;
+  Windows) NATIVE=windows ;;
+  *)       NATIVE="" ;;
+esac
+if [ "$INSTALL" = 1 ]; then
+  [ -n "$NATIVE" ] || die "--install: no installer for $HOST_OS"
+  case " $TARGETS " in
+    *" $NATIVE "*) ;;
+    *) die "--install installs the $NATIVE build, add $NATIVE to the platforms" ;;
+  esac
+fi
 
 if [ -z "$VERSION" ]; then
   VERSION=$(git describe --tags --exact-match 2>/dev/null || true)
@@ -243,6 +266,38 @@ for t in $TARGETS; do
   log "$t: $info, $BUILD_TYPE"
   if ( "build_$t" ); then built="$built $t"; else failed="$failed $t"; warn "$t: build failed"; fi
 done
+
+install_native() {
+  bundle="$WORK/$NATIVE/Datamosh.ofx.bundle"
+  if [ "$NATIVE" = windows ]; then
+    have powershell.exe || die "powershell.exe not found, run install.ps1 manually"
+    set -- -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/install.ps1")" -Path "$(cygpath -w "$bundle")"
+    if [ -n "$INSTALL_DIR" ]; then set -- "$@" -Dest "$INSTALL_DIR"; fi
+    powershell.exe "$@"
+    return
+  fi
+  set -- "$ROOT/install.sh" "$bundle"
+  if [ -n "$INSTALL_DIR" ]; then set -- "$@" --dest "$INSTALL_DIR"; fi
+  dest="${INSTALL_DIR:-${OFX_INSTALL_DIR:-}}"
+  if [ -z "$dest" ]; then
+    if [ "$NATIVE" = macos ]; then dest=/Library/OFX/Plugins; else dest=/usr/OFX/Plugins; fi
+  fi
+  if [ "$(id -u)" -eq 0 ] || [ -w "$dest" ] || { [ ! -e "$dest" ] && [ -w "$(dirname "$dest")" ]; }; then
+    sh "$@"
+  else
+    have sudo || die "need root to write $dest; run: sudo ./install.sh $bundle"
+    echo "    $dest needs root, running install.sh with sudo"
+    sudo OFX_INSTALL_DIR="${OFX_INSTALL_DIR:-}" sh "$@"
+  fi
+}
+
+if [ "$INSTALL" = 1 ]; then
+  case " $built " in
+    *" $NATIVE "*) log "Installing $NATIVE build"
+                   install_native || failed="$failed install" ;;
+    *) warn "--install: the $NATIVE build failed, nothing installed"; failed="$failed install" ;;
+  esac
+fi
 
 log "Done ($VERSION)"
 echo "    built:  ${built:- none}"
