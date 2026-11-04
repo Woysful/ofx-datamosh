@@ -67,7 +67,8 @@ Choose 1 or 2, q to quit [1]:
   or download the release when there is none.
 * `--local` / `--download` (`-Local` / `-Download`) skip the question, a path
   to a bundle or zip installs exactly that, `--dest DIR` (`-Dest DIR`)
-  changes the target directory. Help: `./install.sh --help`,
+  changes the target directory, `--uninstall` (`-Uninstall`) removes the
+  plugin (see [Uninstall](#uninstall)). Help: `./install.sh --help`,
   `Get-Help .\install.ps1 -Detailed`.
 * `install.sh` uses sudo only for the copy step when the target directory
   needs it. `install.ps1` must run as Administrator.
@@ -108,6 +109,38 @@ sudo cp -R Datamosh.ofx.bundle /Library/OFX/Plugins/
 # the binary is not notarised; clear the quarantine flag so Resolve may load it
 sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/Datamosh.ofx.bundle
 ```
+## Uninstall
+
+The installers remove the plugin with `--uninstall` (`-Uninstall` on
+Windows). Only `Datamosh.ofx.bundle` and the bundle of the old transition
+version (`DatamoshTransition.ofx.bundle`) are deleted; other plugins in the
+same directory are left alone. If you installed into a custom directory, pass
+the same `--dest DIR` / `-Dest DIR`.
+
+```sh
+# Linux / macOS, from the repository or an unpacked release archive
+./install.sh --uninstall
+# without a local copy of the script
+curl -fsSL https://raw.githubusercontent.com/Woysful/ofx-datamosh/main/install.sh | sh -s -- --uninstall
+```
+
+```powershell
+# Windows, in PowerShell started as Administrator
+.\install.ps1 -Uninstall
+# without a local copy of the script
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Woysful/ofx-datamosh/main/install.ps1))) -Uninstall
+```
+
+Or delete the bundle by hand:
+
+| OS | Command |
+|---|---|
+| Linux | `sudo rm -rf /usr/OFX/Plugins/Datamosh.ofx.bundle` |
+| macOS | `sudo rm -rf /Library/OFX/Plugins/Datamosh.ofx.bundle` |
+| Windows (Administrator) | `Remove-Item -Recurse -Force "C:\Program Files\Common Files\OFX\Plugins\Datamosh.ofx.bundle"` |
+
+Restart DaVinci Resolve afterwards. Clips that still use the effect show it
+as missing until you remove it from them.
 ## Using it in DaVinci Resolve
 
 1. Put the two clips next to each other on the timeline (a plain cut).

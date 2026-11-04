@@ -32,8 +32,13 @@ Use the local build, do not ask.
 .PARAMETER Download
 Download the latest release, do not ask.
 
+.PARAMETER Uninstall
+Remove the plugin (and the old DatamoshTransition bundle) from the plugin
+directory instead of installing. Uninstall with one line:
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Woysful/ofx-datamosh/main/install.ps1))) -Uninstall
+
 .PARAMETER Dest
-Target directory. Default: $env:OFX_INSTALL_DIR, else
+Directory to install into / uninstall from. Default: $env:OFX_INSTALL_DIR, else
 C:\Program Files\Common Files\OFX\Plugins.
 
 .EXAMPLE
@@ -42,11 +47,14 @@ C:\Program Files\Common Files\OFX\Plugins.
 .\install.ps1 -Download
 .EXAMPLE
 .\install.ps1 -Path .\dist\ofx-datamosh-v1.4-windows-x64.zip
+.EXAMPLE
+.\install.ps1 -Uninstall
 #>
 param(
     [string]$Path,
     [switch]$Local,
     [switch]$Download,
+    [switch]$Uninstall,
     [string]$Dest
 )
 
@@ -156,6 +164,22 @@ function Install-Datamosh {
     }
 
     try {
+        if (-not $Dest) {
+            $Dest = if ($env:OFX_INSTALL_DIR) { $env:OFX_INSTALL_DIR } else { "C:\Program Files\Common Files\OFX\Plugins" }
+        }
+        if ($Uninstall) {
+            if ($Local -or $Download -or $Path) { throw "-Uninstall cannot be combined with -Local, -Download or -Path" }
+            $targets = @($bundleName, "DatamoshTransition.ofx.bundle") |
+                ForEach-Object { Join-Path $Dest $_ } | Where-Object { Test-Path -LiteralPath $_ }
+            if (-not $targets) { Write-Host "Datamosh is not installed in $Dest, nothing to remove."; return 0 }
+            foreach ($t in $targets) {
+                Write-Host "Removing $t"
+                try { Remove-Item -LiteralPath $t -Recurse -Force }
+                catch [System.UnauthorizedAccessException] { throw "No write access to $Dest. Run PowerShell as Administrator and try again." }
+            }
+            Write-Host "Uninstalled. Restart DaVinci Resolve to unload the plugin."
+            return 0
+        }
         if ($Local -and $Download) { throw "-Local and -Download cannot be used together" }
         if ($Path -and $Download) { throw "-Download cannot be combined with -Path" }
         $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
@@ -208,9 +232,6 @@ function Install-Datamosh {
             }
         }
 
-        if (-not $Dest) {
-            $Dest = if ($env:OFX_INSTALL_DIR) { $env:OFX_INSTALL_DIR } else { "C:\Program Files\Common Files\OFX\Plugins" }
-        }
         Write-Host "Installing $bundle"
         try {
             New-Item -ItemType Directory -Force $Dest | Out-Null

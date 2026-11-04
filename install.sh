@@ -18,6 +18,7 @@ esac
 usage() {
   cat <<USAGE
 Usage: ./install.sh [options] [bundle-or-zip]
+       ./install.sh --uninstall [--dest DIR]
        curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh
 
 Installs $BUNDLE_NAME into the OpenFX plugin directory and removes older
@@ -39,12 +40,16 @@ Options:
   -h, --help        show this help and exit
   -l, --local       use the local build, do not ask
   -r, --download    download the latest release, do not ask
-  -d, --dest DIR    install into DIR (default: $DEFAULT_DEST,
+  -u, --uninstall   remove the plugin (and the old DatamoshTransition bundle)
+                    from the plugin directory instead of installing
+  -d, --dest DIR    install into / uninstall from DIR (default: $DEFAULT_DEST,
                     or \$OFX_INSTALL_DIR if set)
 
 Writing to the system directory needs administrator rights; the script runs
-the copy step through sudo when needed. With piped install pass options as:
+the copy / remove step through sudo when needed. With piped install pass
+options as:
   curl -fsSL .../install.sh | sh -s -- --download
+  curl -fsSL .../install.sh | sh -s -- --uninstall
 USAGE
 }
 
@@ -71,12 +76,13 @@ case "$(uname -s)" in
 esac
 DEST="${OFX_INSTALL_DIR:-$DEFAULT_DEST}"
 
-MODE=""; SOURCE=""
+MODE=""; SOURCE=""; UNINSTALL=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)     usage; exit 0 ;;
     -l|--local)    MODE=local ;;
     -r|--download) MODE=download ;;
+    -u|--uninstall) UNINSTALL=1 ;;
     -d|--dest)     if [ "$#" -lt 2 ] || [ -z "$2" ]; then die "$1 needs a value"; fi; DEST="$2"; shift ;;
     --dest=*)      DEST="${1#*=}" ;;
     -*)            die "unknown option: $1 (see --help)" ;;
@@ -85,6 +91,35 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 [ -n "$DEST" ] || die "empty install directory"
+
+# Sets SUDO to "sudo" when DEST (or its nearest existing parent) is not writable.
+pick_sudo() {
+  SUDO=""
+  [ "$(id -u)" -ne 0 ] || return 0
+  probe="$DEST"
+  while [ ! -e "$probe" ]; do probe=$(dirname "$probe"); done
+  if [ ! -w "$probe" ]; then
+    have sudo || die "need write access to $DEST; re-run as root"
+    say "$DEST needs administrator rights, using sudo"
+    SUDO=sudo
+  fi
+}
+
+if [ "$UNINSTALL" = 1 ]; then
+  [ -z "$MODE" ] && [ -z "$SOURCE" ] || die "--uninstall cannot be combined with --local, --download or a bundle"
+  if [ ! -e "$DEST/$BUNDLE_NAME" ] && [ ! -e "$DEST/DatamoshTransition.ofx.bundle" ]; then
+    say "Datamosh is not installed in $DEST, nothing to remove."
+    exit 0
+  fi
+  pick_sudo
+  for b in "$DEST/$BUNDLE_NAME" "$DEST/DatamoshTransition.ofx.bundle"; do
+    [ -e "$b" ] || continue
+    say "Removing $b"
+    $SUDO rm -rf "$b"
+  done
+  say "Uninstalled. Restart DaVinci Resolve to unload the plugin."
+  exit 0
+fi
 if [ -n "$SOURCE" ]; then
   [ "$MODE" != download ] || die "--download cannot be combined with a bundle or archive"
   MODE=local
@@ -292,16 +327,7 @@ case "$MODE" in
     fi ;;
 esac
 
-SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-  probe="$DEST"
-  while [ ! -e "$probe" ]; do probe=$(dirname "$probe"); done
-  if [ ! -w "$probe" ]; then
-    have sudo || die "need write access to $DEST; re-run as root"
-    say "$DEST needs administrator rights, using sudo"
-    SUDO=sudo
-  fi
-fi
+pick_sudo
 
 say "Installing $BUNDLE"
 $SUDO mkdir -p "$DEST"
