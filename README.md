@@ -2,7 +2,9 @@
 
 An OpenFX filter that fakes a **datamosh** across a cut, without touching the
 video stream. Drop it on a clip that contains a cut and the frames after the
-cut melt the way a video with a deleted keyframe does.
+cut melt the way a video with a deleted keyframe does. Or mosh a single clip:
+from a frame you pick, its last P-frames repeat over and over and the picture
+flows on along their motion (duplicated P-frames).
 
 ![sample](docs/sample.png)
 
@@ -51,11 +53,16 @@ The filter has to see both sides of the cut as one clip, hence the compound
 clip; every cut inside it gets moshed. A transition would not work: Resolve
 does not give OpenFX transitions access to neighbouring frames.
 
+To mosh a single clip, drop the filter on it, set **Mosh Type** to
+**Repeat** and **Cut** to **Manual frame** (or **Keyframes**), and set the
+frame where the repeat starts.
+
 ## Main settings
 
 | Setting | What it changes |
 |---|---|
 | Cut | Found automatically. Set it to **Keyframes** to mark the cuts yourself with keyframes of Cut Markers, which you can drag. |
+| Mosh Type | **Transition** (deleted keyframe at a cut) or **Repeat**: from the cut frame on, the last P-frames before it are decoded over and over, so one clip melts by itself. **Repeat Frames** sets how many are looped. |
 | Mosh Style | **Intra + half-pel**: the new shot comes in from the first frame after the cut, like a real stream. **P-only, full-pel**: the old picture is only smeared until recovery starts. |
 | Mosh Length | How many frames after the cut the mosh lasts. |
 | New Data Rate | How fast fresh blocks of the new shot replace the old picture. |

@@ -5,6 +5,7 @@
 * [Parameters](#parameters)
 * [Recovery modes](#recovery-modes)
 * [Mosh styles](#mosh-styles)
+* [Repeat (one-clip mosh)](#repeat-one-clip-mosh)
 * [Marking cuts with keyframes](#marking-cuts-with-keyframes)
 * [Presets](#presets)
 * [Looks to start from](#looks-to-start-from)
@@ -56,16 +57,18 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 | Parameter | Default | Meaning |
 |---|---|---|
 | Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Markers, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). |
-| Cut Frame | 0 | Manual mode: first frame of the new shot, in the clip's own frame numbers (Diagnostics shows `T`). |
-| Cut Markers | Place keyframe on cut | Keyframes mode: every keyframe of this parameter is a cut. The menu has one entry; only the keyframes matter. |
+| Cut Frame | 0 | Manual mode: first frame of the new shot (Repeat: the first repeated frame), in the clip's own frame numbers (Diagnostics shows `T`). |
+| Cut Markers | Place keyframe on cut | Keyframes mode: every keyframe of this parameter is a cut (Repeat: the start of a repeat). The menu has one entry; only the keyframes matter. |
 | Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 
 **Mosh**
 
 | Parameter | Default | Meaning |
 |---|---|---|
+| Mosh Type | Transition | Transition: the new shot's keyframe is missing, the old picture follows the new shot's motion. Repeat: the last P-frames before the cut frame are decoded over and over, a mosh of one clip. See [Repeat](#repeat-one-clip-mosh). |
+| Repeat Frames | 1 | Repeat: how many of the last P-frames are looped. |
 | Mosh Style | Intra + half-pel | See [Mosh styles](#mosh-styles). |
-| Mosh Length | 30 | Frames after the cut the mosh lasts, recovery included. |
+| Mosh Length | 30 | Frames from the cut the mosh lasts, recovery included. |
 | Residual Strength | 1.0 | 0 = pure smear of the old frame, 1 = codec-accurate, >1 overdrive. |
 | New Data Rate | 0.6 | How readily blocks of the new shot are coded intra (fresh) instead of predicted, from the first frame after the cut. 0 = never, about 0.5 behaves like Xvid, higher replaces the old picture faster. |
 | Bloom (P-frame Repeat) | 1 | Decode each P-frame N times. 2-4 gives the melting, over-saturated look. |
@@ -99,7 +102,7 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Checkpoint Memory (MB) | 1024 | RAM for checkpoints, pictures of the mosh saved every few frames so jumps and scrubbing continue from the nearest one. Shared by all Datamosh effects; 0 turns them off. Does not change the picture. See [Performance](#performance). |
+| Jump Cache (MB) | 1024 | RAM for checkpoints, pictures of the mosh saved every few frames so jumps and scrubbing continue from the nearest one. Shared by all Datamosh effects; 0 turns them off. Does not change the picture. See [Performance](#performance). |
 | Render Device | Auto | Where the mosh is computed: Auto (an NVIDIA GPU through CUDA, else another GPU through OpenCL, else the CPU), CPU, CUDA or OpenCL. The picture is the same on every device. See [Performance](#performance). |
 | View | Result | "Motion vectors" shows the field used for the frame (x -> red, y -> green, intra = white). "Diagnostics" overlays numbers. |
 
@@ -144,6 +147,40 @@ When you switch style, Residual Strength and Recovery move to the new
 style's defaults, but only if they were still at the old style's defaults;
 values you changed stay. Every Recovery mode works with both styles.
 
+## Repeat (one-clip mosh)
+
+With **Mosh Type** on **Repeat** the plugin imitates the other classic
+datamosh: duplicated P-frames. From the cut frame on (here it is the frame
+where the repeat starts, set with Cut Frame or Cut Markers) the decoder
+decodes the last P-frames before it over and over instead of the real ones.
+The picture stays on the last real frame and keeps flowing along the motion
+of those frames: what moved there smears further and further the same way,
+and every repeat adds the same residual again, so the colours bloom and
+burn. No second shot is needed.
+
+* **Repeat Frames** sets how many of the last P-frames are looped. 1 repeats
+  the motion of the frame just before the start; 3-8 loop a short stretch
+  of motion, which looks less uniform. Up to 8 looped frames are kept in
+  memory; longer loops fetch their frames from the host again for every
+  step, which is slower.
+* The motion vectors stay where they were in the looped frames: the picture
+  flows where things moved and holds still elsewhere, as in a real stream.
+* Mosh Style matters as in a transition. With Intra + half-pel, blocks the
+  encoder coded intra in the looped frames are pasted in again on every
+  repeat, so parts of the picture hold still; P-only, full-pel smears
+  everything.
+* Residual Strength sets how much the repeated residual piles up (try
+  0.3-0.6 if the colours burn out too fast); Bloom speeds up the flow.
+* By the end of Mosh Length the live clip is back. Recovery brings it in as
+  in a transition: the stylised modes blend the live clip over the repeat,
+  Encoder intra decisions heals the repeat with growing blocks of the live
+  clip, Motion-adaptive intra refresh refreshes first where the live clip
+  moves.
+* Auto cut detection works too: the repeat then starts at a hard cut and
+  the old shot's last motion carries on over the new shot.
+* A repeat needs the frame before each looped P-frame. A start closer to the
+  beginning of the clip than Repeat Frames + 1 frames loops fewer frames;
+  on the clip's first two frames there is nothing to repeat.
 ## Marking cuts with keyframes
 
 Auto finds every hard cut in the clip by itself. When you want to pick the
@@ -234,7 +271,7 @@ the mosh rendered before continues from the nearest checkpoint before the
 frame, a few steps instead of the whole chain. Jumping past everything
 rendered so far still runs the steps from the last checkpoint (or the cut)
 up to the frame. A 1080p checkpoint takes 33 MB, a UHD one 133 MB. They
-share **Checkpoint Memory** (1024 MB by default) across all Datamosh
+share **Jump Cache** (1024 MB by default) across all Datamosh
 effects, at least 8 frames apart and further apart when a long mosh would
 not fit; when the memory is full, the least recently used go first.
 
@@ -270,7 +307,7 @@ Tips if it is still slow:
 
 * Block Size 32x32 is about 4x faster than 16x16 and looks chunkier, often
   better.
-* For long moshes at UHD, raise Checkpoint Memory so the checkpoints sit
+* For long moshes at UHD, raise Jump Cache so the checkpoints sit
   closer together and jumps take fewer steps.
 * In Resolve, render the clip in place (right-click > Render in Place) once
   you like it.
@@ -281,7 +318,9 @@ Set **View** to **Diagnostics** on a frame just after the cut:
 
 * `CUT n` is the detected cut frame; `NO CUT` means nothing within Mosh
   Length frames exceeded Cut Threshold. `SCAN MAX DIFF` is the largest jump
-  seen: if it is below `THR`, lower Cut Threshold.
+  seen: if it is below `THR`, lower Cut Threshold. `REPEAT n` (Mosh Type
+  Repeat) is the number of P-frames looped, fewer than Repeat Frames near
+  the start of the clip.
 * `PAIR DIFF` is the difference between the two frames of the last motion
   step. Near 0.0000 means the host returned the same frame for different
   times (no temporal access), so there is no motion to work with.

@@ -78,6 +78,8 @@ const char* kIntra = "intraThreshold";      // double 0..1
 const char* kSmooth = "smoothVectors";      // bool
 const char* kFillFlat = "fillFlat";         // bool
 const char* kMoshStyle = "moshStyle";       // choice: intra + half-pel / P-only, full-pel
+const char* kMoshType = "moshType";         // choice: transition / repeat
+const char* kRepeatFrames = "repeatFrames"; // int: Repeat, P-frames looped
 const char* kIntraRate = "intraRate";       // double 0..1: encoder-style intra decision
 const char* kSubpel = "halfPelMotion";      // bool
 const char* kRecoverStart = "recoverStart"; // double 0..1
@@ -110,6 +112,8 @@ static const int kDefaultRecovery = (int)mosh::Recovery::Natural;
 static const int kStylePOnly = 1;
 static const int kCutManual = 1;
 static const int kCutKeyframes = 2;
+static const int kMoshRepeat = 1;
+static const int kMaxRepeatFrames = 30;
 
 struct StyleDefaults {
     double residual;
@@ -449,6 +453,8 @@ struct Settings {
     int cutFrame = 0;
     float cutThreshold = 0.12f;
     int moshLength = 30;
+    int moshType = 0;
+    int repeatFrames = 1;
     int block = 16;
     int range = 48;
     float motionScale = 1.f;
@@ -478,6 +484,8 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.cutFrame = getInt(ps, P::kCutFrame, t, 0);
     s.cutThreshold = (float)getDouble(ps, P::kCutThreshold, t, 0.12);
     s.moshLength = std::max(2, getInt(ps, P::kMoshLength, t, 30));
+    s.moshType = getInt(ps, P::kMoshType, t, 0) == kMoshRepeat ? kMoshRepeat : 0;
+    s.repeatFrames = std::min(std::max(getInt(ps, P::kRepeatFrames, t, 1), 1), kMaxRepeatFrames);
     const int bi = std::min(std::max(getInt(ps, P::kBlockSize, t, 1), 0), 3);
     s.block = kBlockSizes[bi];
     s.range = getInt(ps, P::kSearchRange, t, 48);
@@ -517,6 +525,9 @@ static uint64_t chainHash(const Settings& s, const OfxRectI& r) {
     mix((uint64_t)s.block); mix((uint64_t)s.range); mixf(s.motionScale); mixf(s.residual);
     mix((uint64_t)s.repeat); mixf(s.intraThreshold); mix(s.smooth); mix(s.fillFlat);
     mix(s.clampLevels); mixf(s.intraRate); mix(s.subpel);
+    if (s.moshType == kMoshRepeat) {
+        mix(0x7e9ea7); mix((uint64_t)s.repeatFrames);
+    }
     const auto mode = (mosh::Recovery)s.recoverMode;
     if (mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural) {
         // these modes recover inside the chain
@@ -659,6 +670,23 @@ struct Instance {
     static constexpr size_t kAccEntries = 2;
     static constexpr size_t kMaxDiffs = 100000;
 
+    // Repeat: the looped source frames and their motion fields, which every
+    // frame of the mosh steps through again.
+    struct HeldFrame {
+        double t;
+        OfxRectI r;
+        FramePtr f;
+    };
+    std::deque<HeldFrame> held;  // most recently used last
+    struct FieldEntry {
+        uint64_t hash;
+        double t;  // the field's earlier frame
+        mosh::MotionField mf;
+    };
+    std::deque<FieldEntry> fields;
+    static constexpr size_t kHeldFrames = 9;
+    static constexpr size_t kFieldEntries = 32;
+
     // Unstrided chain renders in progress. Hosts render several frames at
     // once during playback; a render whose nearest usable picture is an
     // earlier frame still being rendered waits for that frame instead of
@@ -748,6 +776,8 @@ struct Instance {
             accCache.clear();
             stored.clear();
             frame.reset();
+            held.clear();
+            fields.clear();
         }
         busyDone.notify_all();
         gCheckpoints.forget(this);
@@ -764,6 +794,43 @@ struct Instance {
         frameT = t;
         frameRect = r;
         frame = f;
+    }
+    FramePtr getHeld(double t, const OfxRectI& r) {
+        std::lock_guard<std::mutex> g(m);
+        for (auto it = held.begin(); it != held.end(); ++it)
+            if (it->t == t && !memcmp(&it->r, &r, sizeof r)) {
+                HeldFrame h = *it;
+                held.erase(it);
+                held.push_back(h);
+                return h.f;
+            }
+        return nullptr;
+    }
+    void putHeld(double t, const OfxRectI& r, const FramePtr& f) {
+        std::lock_guard<std::mutex> g(m);
+        for (auto it = held.begin(); it != held.end(); ++it)
+            if (it->t == t && !memcmp(&it->r, &r, sizeof r)) {
+                held.erase(it);
+                break;
+            }
+        held.push_back({t, r, f});
+        while (held.size() > kHeldFrames) held.pop_front();
+    }
+    bool getField(uint64_t hash, double t, mosh::MotionField& mf) {
+        std::lock_guard<std::mutex> g(m);
+        for (const FieldEntry& e : fields)
+            if (e.hash == hash && e.t == t) {
+                mf = e.mf;
+                return true;
+            }
+        return false;
+    }
+    void putField(uint64_t hash, double t, const mosh::MotionField& mf) {
+        std::lock_guard<std::mutex> g(m);
+        for (const FieldEntry& e : fields)
+            if (e.hash == hash && e.t == t) return;
+        fields.push_back({hash, t, mf});
+        while (fields.size() > kFieldEntries) fields.pop_front();
     }
     bool getDiff(long f, float& d) {
         std::lock_guard<std::mutex> g(m);
@@ -901,6 +968,26 @@ struct Plan {
     float q = 0.f;              // recovery progress
     bool passThrough = true;    // output == source
     int cutKeys = 0;            // keyframes of Cut Markers, -1: host does not report them
+    double clipFirst = -1e300;  // first frame of the source clip, if the host says
+    // Repeat: from cutFrame on, the loopLen P-frames before it are decoded
+    // over and over. The chain then starts at cutFrame - 1 (the last real
+    // frame) and times[0] == cutFrame - 1.
+    bool repeat = false;
+    int loopLen = 0;
+
+    // The two source frames whose motion and residual make the step to
+    // the picture of frame tau.
+    void pair(double tau, double& prevT, double& curT) const {
+        if (!repeat) {
+            prevT = tau - 1.0;
+            curT = tau;
+            return;
+        }
+        const long k = std::lround(tau - cutFrame);
+        const long i = ((k % loopLen) + loopLen) % loopLen;
+        prevT = cutFrame - (double)loopLen - 1.0 + (double)i;
+        curT = prevT + 1.0;
+    }
 };
 
 static void finishPlan(Plan& pl) {
@@ -909,6 +996,20 @@ static void finishPlan(Plan& pl) {
     pl.q = recoveryAmount(pl.s, pl.progress);
     pl.passThrough = pl.t < pl.cutFrame - 1e-9 || pl.progress >= 1.0;
     pl.nFrames = std::max(0, (int)std::lround(pl.t - pl.cutFrame));
+    pl.repeat = pl.s.moshType == kMoshRepeat;
+    if (pl.repeat) {
+        // Every looped P-frame needs the frame before it inside the clip.
+        const double before = std::floor(pl.cutFrame - 1.0 - pl.clipFirst + 1e-6);
+        pl.loopLen = (int)std::min((double)pl.s.repeatFrames, std::max(0.0, before));
+        pl.s.repeatFrames = pl.loopLen;  // what the chain really loops, for chainHash
+        pl.times.clear();
+        pl.steps = 0;
+        if (pl.loopLen < 1) pl.passThrough = true;
+        if (pl.passThrough) return;
+        pl.steps = pl.nFrames + 1;
+        for (int i = 0; i <= pl.steps; ++i) pl.times.push_back(pl.cutFrame - 1.0 + (double)i);
+        return;
+    }
     // One step per frame, always: a chain sampled at a coarser stride could
     // not continue from the previous frame's result and would differ from
     // frame to frame. Checkpoints keep jumps into a mosh cheap instead.
@@ -921,16 +1022,10 @@ static void finishPlan(Plan& pl) {
 // Keyframes mode: the most recent keyframe of Cut Markers at or before t is
 // the first frame of the new shot. A keyframe on the clip's first frame has
 // no old picture before it and is skipped.
-static void keyframeCut(OfxImageEffectHandle inst, OfxParamSetHandle ps, Plan& pl) {
+static void keyframeCut(OfxParamSetHandle ps, Plan& pl) {
     OfxParamHandle h = nullptr;
     if (!ps || gParam->paramGetHandle(ps, P::kCutMarker, &h, nullptr) != kOfxStatOK || !h) return;
-    double first = -1e300;
-    OfxImageClipHandle src = nullptr;
-    OfxPropertySetHandle cp = nullptr;
-    if (gEffect->clipGetHandle(inst, kOfxImageEffectSimpleSourceClipName, &src, &cp) == kOfxStatOK && cp) {
-        double r[2] = {0, 0};
-        if (gProp->propGetDoubleN(cp, kOfxImageEffectPropFrameRange, 2, r) == kOfxStatOK) first = r[0];
-    }
+    const double first = pl.clipFirst;
     const double eps = 1e-6;
     unsigned int n = 0;
     if (gParam->paramGetNumKeys && gParam->paramGetKeyTime && gParam->paramGetNumKeys(h, &n) == kOfxStatOK) {
@@ -955,12 +1050,18 @@ static Plan makePlan(OfxImageEffectHandle inst, double t) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     pl.s = readSettings(ps, t);
+    OfxImageClipHandle src = nullptr;
+    OfxPropertySetHandle cp = nullptr;
+    if (gEffect->clipGetHandle(inst, kOfxImageEffectSimpleSourceClipName, &src, &cp) == kOfxStatOK && cp) {
+        double r[2] = {0, 0};
+        if (gProp->propGetDoubleN(cp, kOfxImageEffectPropFrameRange, 2, r) == kOfxStatOK) pl.clipFirst = r[0];
+    }
     if (pl.s.cutMode == kCutManual) {
         pl.cutKnown = true;
         pl.cutFrame = pl.s.cutFrame;
         finishPlan(pl);
     } else if (pl.s.cutMode == kCutKeyframes) {
-        keyframeCut(inst, ps, pl);
+        keyframeCut(ps, pl);
         if (pl.cutKnown) finishPlan(pl);
     }
     return pl;
@@ -1114,13 +1215,15 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                  "Manual uses the frame below; Keyframes uses the keyframes of Cut Markers.",
                  {"Auto (scene-change detection)", "Manual frame", "Keyframes (Cut Markers)"}, 0);
     defineInt(ps, P::kCutFrame, "Cut Frame",
-              "Manual mode: first frame of the new shot, in the clip's own frame numbers (see Diagnostics).",
+              "Manual mode: first frame of the new shot (Repeat: the first repeated frame), in the clip's own "
+              "frame numbers (see Diagnostics).",
               0, 0, 1000000);
     {
         // A one-entry menu: it only carries keyframes, its value never changes.
         OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kCutMarker, "Cut Markers",
                                              "Keyframes mode: every keyframe of this parameter marks a cut (the "
-                                             "first frame of the new shot). Add a keyframe at each cut you want "
+                                             "first frame of the new shot; Repeat: where a repeat starts). Add a "
+                                             "keyframe at each cut you want "
                                              "moshed; drag a keyframe to move its cut, delete it to drop the cut. "
                                              "A keyframe on the clip's first frame is ignored.");
         gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Place keyframe on cut");
@@ -1133,6 +1236,17 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                  0.12, 0.02, 1.0);
 
     beginGroup(ps, P::kGrpMosh, "Mosh", "How the old picture is dragged and smeared.", true);
+    defineChoice(ps, P::kMoshType, "Mosh Type",
+                 "Transition: the keyframe of the new shot is missing, so the old picture is dragged along by the "
+                 "new shot's motion. Repeat: from the cut frame on, the last P-frames before it are decoded over "
+                 "and over (duplicated P-frames), so the picture keeps flowing along their motion and the "
+                 "residuals pile up; it needs no second shot. In both, the live clip comes back through Recovery.",
+                 {"Transition (missing keyframe)", "Repeat (duplicated P-frames)"}, 0);
+    defineInt(ps, P::kRepeatFrames, "Repeat Frames",
+              "Repeat: how many of the last P-frames before the cut frame are looped. 1 repeats the motion of the "
+              "last frame; more loop a longer stretch of motion. Up to 8 are kept in memory, longer loops fetch "
+              "their frames from the host again.",
+              1, 1, kMaxRepeatFrames);
     defineChoice(ps, P::kMoshStyle, "Mosh Style",
                  "Intra + half-pel: the new shot replaces the old picture from the first frame after the cut, "
                  "the way it does in a real stream with a deleted keyframe: encoder-style intra/inter mode "
@@ -1143,7 +1257,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                  "at the other style's defaults.",
                  {"Intra + half-pel (new shot from the cut)", "P-only, full-pel (smear until recovery)"}, 0);
     defineInt(ps, P::kMoshLength, "Mosh Length",
-              "How many frames after the cut the mosh lasts (including recovery).", 30, 2, 600);
+              "How many frames from the cut the mosh lasts (including recovery).", 30, 2, 600);
     defineDouble(ps, P::kResidual, "Residual Strength",
                  "How much of each P-frame residual bleeds in. 0 = pure smear of the old picture, "
                  "1 = codec-accurate, higher overdrives the colours.",
@@ -1228,7 +1342,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
               "of Encoder intra decisions.", 0, 0, 9999);
 
     beginGroup(ps, P::kGrpAdvanced, "Performance & Debug", "Speed limits and debug views.", true);
-    defineInt(ps, P::kCheckpointMB, "Checkpoint Memory (MB)",
+    defineInt(ps, P::kCheckpointMB, "Jump Cache (MB)",
               "RAM for pictures saved every few frames of a mosh while it renders, so jumping or scrubbing into a "
               "mosh rendered before continues from the nearest one instead of starting again at the cut. Shared "
               "by all Datamosh effects, the oldest go first; 0 turns checkpoints off. Does not change the result.",
@@ -1291,6 +1405,7 @@ static void updateEnabled(OfxImageEffectHandle inst) {
                                  mode == mosh::Recovery::Natural || directional);
     setEnabled(ps, P::kRecoverCurve, mode != mosh::Recovery::HardCut);
     setEnabled(ps, P::kRecoverStart, mode != mosh::Recovery::Natural);
+    setEnabled(ps, P::kRepeatFrames, currentInt(ps, P::kMoshType, 0) == kMoshRepeat);
     const bool pOnly = currentInt(ps, P::kMoshStyle, 0) == kStylePOnly;
     setEnabled(ps, P::kIntraRate, !pOnly);
     setEnabled(ps, P::kSubpel, !pOnly);
@@ -1334,6 +1449,7 @@ struct PresetParam {
 };
 static const PresetParam kPresetParams[] = {
     {P::kCutMode, false},     {P::kCutThreshold, true},
+    {P::kMoshType, false},    {P::kRepeatFrames, false},
     {P::kMoshStyle, false},   {P::kMoshLength, false},    {P::kResidual, true},     {P::kIntraRate, true},
     {P::kRepeat, false},      {P::kMotionScale, true},    {P::kClamp, false},       {P::kBlockSize, false},
     {P::kSearchRange, false}, {P::kSubpel, false},        {P::kIntra, true},        {P::kSmooth, false},
@@ -1797,7 +1913,15 @@ static OfxStatus getFramesNeeded(OfxImageEffectHandle inst, OfxPropertySetHandle
     if (pl.cutKnown) {
         if (!pl.passThrough) {
             ts.push_back(pl.cutFrame - 1.0);
-            ts.insert(ts.end(), pl.times.begin(), pl.times.end());
+            const auto mode = (mosh::Recovery)pl.s.recoverMode;
+            if (pl.repeat) {
+                for (int k = 0; k <= pl.loopLen; ++k) ts.push_back(pl.cutFrame - 1.0 - (double)k);
+                // recovery inside the chain brings back the live clip at every step
+                if (mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural)
+                    ts.insert(ts.end(), pl.times.begin(), pl.times.end());
+            } else {
+                ts.insert(ts.end(), pl.times.begin(), pl.times.end());
+            }
         }
     } else if (pl.s.cutMode == 0) {
         const int L = std::max(1, pl.s.moshLength);
@@ -1872,13 +1996,24 @@ struct FrameSource {
     FramePtr prev;
     const ChainTicket* ticket = nullptr;  // told about every finished step
     const CheckpointPlan* checkpoints = nullptr;
+    // Repeat: the looped frames (heldFrom..heldTo) are kept in, and their
+    // motion fields cached by, this instance.
+    Instance* held = nullptr;
+    double heldFrom = 0, heldTo = -1;
+    Instance* fields = nullptr;
+    uint64_t hash = 0;
     mutable int fetched = 0;              // frames fetched from the host by get()
 
     FramePtr get(double t) const {
         if (cur && t == tCur) return cur;
         if (prev && t == tPrev) return prev;
+        const bool keep = held && t >= heldFrom - 1e-6 && t <= heldTo + 1e-6;
+        if (keep)
+            if (FramePtr f = held->getHeld(t, rect)) return f;
         ++fetched;
-        return fetchFrame(clip, t, rect, pf);
+        FramePtr f = fetchFrame(clip, t, rect, pf);
+        if (keep && f) held->putHeld(t, rect, f);
+        return f;
     }
 };
 
@@ -1893,8 +2028,9 @@ static std::vector<double> stepsFrom(double a, double t) {
     return ts;
 }
 
-// Runs motion steps over frames `times` on top of acc, or on top of the
-// GPU's accumulated picture when gpu is set. Returns false on a GPU error.
+// Runs motion steps to the pictures of frames `times` (after the first) on
+// top of acc, or on top of the GPU's accumulated picture when gpu is set.
+// Returns false on a GPU error.
 static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Plan& pl,
                      const std::vector<double>& times, mosh::Image& acc, ChainResult& cr,
                      const mosh::ParallelFor& pf, mosh_gpu::Session* gpu = nullptr) {
@@ -1917,34 +2053,92 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
     const mosh::MotionParams mp = motionParams(s);
 
     if (times.size() < 2) return true;
+    // The last few frames used, so consecutive steps do not fetch them again.
+    struct Recent {
+        double t = 0;
+        FramePtr f;
+        unsigned used = 0;
+    };
+    Recent recent[4];
+    unsigned clock = 0;
+    auto frame = [&](double ft) -> FramePtr {
+        for (Recent& r : recent)
+            if (r.f && r.t == ft) {
+                r.used = ++clock;
+                return r.f;
+            }
+        FramePtr f = fs.get(ft);
+        if (!f) return f;
+        Recent* slot = &recent[0];
+        for (Recent& r : recent)
+            if (r.used < slot->used) slot = &r;
+        slot->t = ft;
+        slot->f = f;
+        slot->used = ++clock;
+        return f;
+    };
+    const double L = (double)std::max(1, s.moshLength);
     mosh::Image scratch;
-    FramePtr prev = fs.get(times[0]);
-    if (!prev) return true;
     for (size_t i = 1; i < times.size(); ++i) {
-        FramePtr cur = fs.get(times[i]);
+        const double tau = times[i];
+        const double p = (tau - pl.cutFrame) / L;
+        double prevT, curT;
+        pl.pair(tau, prevT, curT);
+        FramePtr prev = frame(prevT);
+        FramePtr cur = prev ? frame(curT) : nullptr;
         if (!cur) break;
+        if (refresh) rs.q = recoveryAmount(s, p);
+        if (natural) {
+            ns.q = naturalAmount(s, p);
+            ns.frame = std::lround(tau);
+        }
+        // Repeat: recovery inside the chain brings back the live clip, not
+        // the looped frames.
+        FramePtr live, livePrev;
+        if (pl.repeat && (natural || (refresh && rs.q > 0.f))) {
+            live = frame(tau);
+            if (live && refresh) livePrev = frame(tau - 1.0);
+            if (!live || (refresh && !livePrev)) break;
+        }
         if (gEffect->abort(inst)) {
             cr.aborted = true;
             break;
         }
         if (i == 1) cr.firstPairDiff = meanAbsDiff(*prev, *cur);
         mosh::MotionField& mf = cr.lastField;
-        if (gpu) {
-            if (!gpu->estimateMotion(prev, cur, mp, mf, pf)) return false;
-        } else {
-            mf = mosh::estimateMotion(*prev, *cur, mp, pf);
+        if (!fs.fields || !fs.fields->getField(fs.hash, prevT, mf)) {
+            if (gpu) {
+                if (!gpu->estimateMotion(prev, cur, mp, mf, pf)) return false;
+            } else {
+                mf = mosh::estimateMotion(*prev, *cur, mp, pf);
+            }
+            if (fs.fields) fs.fields->putField(fs.hash, prevT, mf);
         }
-        if (natural) {
-            ns.q = naturalAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
-            ns.frame = std::lround(times[i]);
-            mosh::naturalIntra(mf, ns, cr.refreshed);
-        }
+        if (natural && !pl.repeat) mosh::naturalIntra(mf, ns, cr.refreshed);
         if (gpu) {
             if (!gpu->moshStep(prev, cur, mf, sp)) return false;
         } else {
             mosh::moshStep(*prev, *cur, mf, sp, acc, scratch, pf);
         }
-        if (natural) {
+        if (natural && pl.repeat) {
+            // Healed blocks show the live clip and spread the way the new
+            // shot's blocks do in a transition; the looped frames' own intra
+            // blocks stay part of the repeat.
+            mosh::MotionField heal = mf;
+            std::fill(heal.intra.begin(), heal.intra.end(), (uint8_t)0);
+            heal.sse.clear();
+            heal.var.clear();
+            mosh::naturalIntra(heal, ns, cr.refreshed);
+            mosh::naturalCarry(heal, ns, cr.refreshed);
+            mosh::RefreshPull rp;
+            rp.rate = 1.f;
+            rp.tail = mosh::naturalTail(ns);
+            if (gpu) {
+                if (!gpu->pull(live, mf, cr.refreshed, rp.rate, rp.tail)) return false;
+            } else {
+                mosh::refreshBlend(*live, mf, cr.refreshed, rp, acc, pf);
+            }
+        } else if (natural) {
             if (gpu) {
                 // mosh::naturalAfter, with the fresh blocks left alone.
                 mosh::naturalCarry(mf, ns, cr.refreshed);
@@ -1955,7 +2149,8 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
             }
         }
         if (refresh) {
-            rs.q = recoveryAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
+            const FramePtr& from = live ? livePrev : prev;
+            const FramePtr& to = live ? live : cur;
             if (gpu) {
                 // mosh::refreshStep
                 const size_t nb = (size_t)mf.bw * mf.bh;
@@ -1963,25 +2158,24 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
                 if (rs.q > 0.f && nb > 0) {
                     std::vector<float> sums;
                     std::vector<int> counts;
-                    if (!gpu->refreshActivity(prev, cur, mf, sums, counts)) return false;
+                    if (!gpu->refreshActivity(from, to, mf, sums, counts)) return false;
                     const mosh::RefreshPull rp = mosh::refreshDecide(mf, rs, sums, counts, cr.refreshed);
-                    if (!gpu->pull(cur, mf, cr.refreshed, rp.rate, rp.tail)) return false;
+                    if (!gpu->pull(to, mf, cr.refreshed, rp.rate, rp.tail)) return false;
                 }
             } else {
-                mosh::refreshStep(*prev, *cur, mf, rs, cr.refreshed, acc, pf);
+                mosh::refreshStep(*from, *to, mf, rs, cr.refreshed, acc, pf);
             }
         }
-        prev = std::move(cur);
         ++cr.stepsDone;
         const CheckpointPlan* ck = fs.checkpoints;
-        if (ck && ck->due(times[i]) && !gCheckpoints.has(ck->owner, times[i], ck->cut, ck->hash)) {
+        if (ck && ck->due(tau) && !gCheckpoints.has(ck->owner, tau, ck->cut, ck->hash)) {
             mosh::Image copy;
             if (gpu) {
                 if (!gpu->downloadAcc(copy)) return false;
             } else {
                 copy = acc;
             }
-            gCheckpoints.put(ck->owner, times[i], ck->cut, ck->hash, std::move(copy), cr.refreshed, ck->budget);
+            gCheckpoints.put(ck->owner, tau, ck->cut, ck->hash, std::move(copy), cr.refreshed, ck->budget);
         }
         if (fs.ticket) fs.ticket->beat();
     }
@@ -1998,7 +2192,7 @@ static bool renderOnGpu(OfxImageEffectHandle inst, mosh_gpu::Session& gpu, Insta
     bool ok;
     // Continue from the newest cached picture of the chain, on the GPU or the
     // CPU, or from the newest checkpoint.
-    const bool reuse = pl.nFrames >= 1 && cache;
+    const bool reuse = pl.steps >= 1 && cache;
     const double onGpu = reuse ? gpu.latestAcc(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
     const double onCpu = reuse ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
     const double onCk = reuse ? gCheckpoints.latest(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
@@ -2062,6 +2256,7 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
     line("DATAMOSH " PLUGIN_VERSION_STRING);
     line("T " + fmt("%.1f", pl.t) + "  PROG " + fmt("%.3f", pl.progress) +
          (pl.cutKnown ? "  CUT " + fmt("%.0f", pl.cutFrame) : "  NO CUT") +
+         (pl.repeat ? "  REPEAT " + fmt("%.0f", pl.loopLen) : std::string()) +
          (pl.s.cutMode == kCutKeyframes ? (pl.cutKeys < 0 ? std::string("  KEYS UNKNOWN") : "  KEYS " + fmt("%.0f", pl.cutKeys))
                                         : std::string()));
     line("SCAN MAX DIFF " + fmt("%.4f", pl.scanMaxDiff) + "  THR " + fmt("%.3f", pl.s.cutThreshold) +
@@ -2162,6 +2357,13 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         return finish();
     }
 
+    if (cache && pl.repeat && !pl.passThrough) {
+        fs.held = cache;
+        fs.heldFrom = pl.cutFrame - (double)pl.loopLen - 1.0;
+        fs.heldTo = pl.cutFrame - 1.0;
+        fs.fields = cache;
+        fs.hash = chainHash(s, R);
+    }
     ChainTicket ticket;
     CheckpointPlan ck;
     const size_t budget = (size_t)s.checkpointMB << 20;
@@ -2219,7 +2421,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         hash = chainHash(s, R);
         // Fast path: an earlier frame's accumulated picture is cached or
         // checkpointed, and the steps from there give exactly the same result.
-        const bool reuse = pl.nFrames >= 1 && cache;
+        const bool reuse = pl.steps >= 1 && cache;
         const double onCpu = reuse ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
         const double onCk = reuse ? gCheckpoints.latest(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
         if (onCpu > -HUGE_VAL && onCpu >= onCk && cache->getAcc(onCpu, pl.cutFrame, hash, acc, cr.refreshed)) {
