@@ -1,0 +1,3 @@
+# Hashed by cmake/embed_kernels.cmake: keep the bytes the same on every platform.
+src/mosh_kernels.cl text eol=lf
+src/mosh_kernels.ptx text eol=lf

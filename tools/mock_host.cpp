@@ -593,8 +593,11 @@ int main(int argc, char** argv) {
             Clip* src = inst.clips[idOut.s[kOfxPropName][0]].get();
             printf("frame %d: identity -> %s\n", i, src->name.c_str());
             const Frame& fr = src->frames[std::min(i, (int)src->frames.size() - 1)];
-            toRgb(fr.rgba);
-            fwrite(rgbOut.data(), 1, rgbOut.size(), fo);
+            if (getenv("MOCK_FLOAT")) fwrite(fr.rgba.data(), sizeof(float), fr.rgba.size(), fo);
+            else {
+                toRgb(fr.rgba);
+                fwrite(rgbOut.data(), 1, rgbOut.size(), fo);
+            }
             continue;
         }
 
@@ -606,7 +609,10 @@ int main(int argc, char** argv) {
         renderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
         ++renders;
         if (out->live.empty()) { fprintf(stderr, "render did not fetch output image\n"); return 1; }
-        if (gScale != 1.0) {  // nearest-neighbour back to full size
+        if (getenv("MOCK_FLOAT")) {  // raw float RGBA of the output image, for exact comparisons
+            const std::vector<float>& s = out->live.back()->data;
+            fwrite(s.data(), sizeof(float), s.size(), fo);
+        } else if (gScale != 1.0) {  // nearest-neighbour back to full size
             const int sw = std::max(1, (int)std::lround(w * gScale)), sh = std::max(1, (int)std::lround(h * gScale));
             const std::vector<float>& s = out->live.back()->data;
             std::vector<float> up((size_t)w * h * 4);

@@ -3,7 +3,10 @@
 [Back to README](../README.md)
 
 The plugin is a plain OpenFX 1.4 filter (Filter context, RGBA or RGB, 8-bit,
-16-bit or float, CPU rendering) with no host-specific code. It needs one
+16-bit or float, host-side CPU rendering) with no host-specific code. The
+optional GPU path (see Render Device in the user guide) talks to the CUDA or
+OpenCL driver directly with its own context, so it does not depend on the
+host's GPU support either; the host always hands over CPU images. It needs one
 thing from the host: **temporal clip access**, i.e. a filter may fetch frames
 other than the one being rendered. A host that reports it does not support
 this gets a clean "missing host feature" error instead of a broken effect.

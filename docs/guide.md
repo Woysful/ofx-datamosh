@@ -100,6 +100,7 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 | Parameter | Default | Meaning |
 |---|---|---|
 | Max Motion Steps | 48 | Cap on frame pairs analysed per frame when the cache is cold. |
+| Render Device | Auto | Where the mosh is computed: Auto (an NVIDIA GPU through CUDA, else another GPU through OpenCL, else the CPU), CPU, CUDA or OpenCL. The picture is the same on every device. See [Performance](#performance). |
 | View | Result | "Motion vectors" shows the field used for the frame (x -> red, y -> green, intra = white). "Diagnostics" overlays numbers. |
 
 ## Recovery modes
@@ -230,6 +231,22 @@ backwards or jumping into the middle of a mosh rebuilds the chain from the
 cut (bounded by **Max Motion Steps**). Each source frame is fetched from the
 host once per render and the frame before it is kept from the previous
 render, so in-order playback asks the host for one new frame per frame.
+**GPU.** With Render Device on Auto the motion search and the mosh steps run
+on the GPU when there is one: an NVIDIA card through CUDA, AMD, Intel or
+other cards through OpenCL. The GPU follows the CPU code operation for
+operation, so the frames are bit for bit the same as on the CPU, and you can
+switch devices in the middle of a project. Nothing has to be installed beyond
+the normal graphics driver. The plugin uses its own GPU context next to
+Resolve's and keeps the frames of the current mosh in GPU memory (roughly
+0.3 GB for 1080p, 1 GB or a bit more for UHD). When the GPU cannot be used (no driver, too little
+memory, an error) the frame is rendered on the CPU instead; after three
+failed frames in a row the GPU is left alone until the plugin is reloaded.
+The Diagnostics line `DEV` shows which device rendered the frame and, for
+the CPU, why the GPU was not used. The Motion vectors view is always drawn
+on the CPU. With several GPUs, set the environment variable
+`OFX_DATAMOSH_GPU_DEVICE` to part of a device name (e.g. `4090`) before
+starting the host to pick one.
+
 Tips if it is still slow:
 
 * Block Size 32x32 is about 4x faster than 16x16 and looks chunkier, often
@@ -255,3 +272,6 @@ Set **View** to **Diagnostics** on a frame just after the cut:
   Motion-adaptive intra refresh has already refreshed (Encoder intra
   decisions: blocks that already carry the new shot), in percent. `INTRA`
   is the share of blocks coded intra in this frame.
+* `DEV` is the device that rendered the frame: `CUDA` or `OPENCL` with the
+  GPU name, or `CPU`, followed by the reason when a GPU was asked for but
+  not used.

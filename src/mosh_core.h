@@ -434,9 +434,17 @@ inline void postProcessField(MotionField& mf, std::vector<uint8_t> flat, const M
 
 inline bool needsRefine(const MotionParams& mp) { return mp.halfPel || mp.intraRate > 0.f || mp.blockStats; }
 
-// Half-pel refinement and per-block statistics (sse, var) on full-res luma.
-inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, const MotionParams& mp, MotionField& mf,
-                        const ParallelFor& pf) {
+// Half-pel refinement tries the integer vector (k = 0), then the eight
+// neighbours half a pixel away in this order (k = 1..8).
+static const int kRefineCandidates = 9;
+inline void refineOffset(int k, int& ox, int& oy) {
+    int j = k - 1;
+    if (j >= 4) ++j;
+    ox = j % 3 - 1;
+    oy = j / 3 - 1;
+}
+
+inline void prepareRefine(MotionField& mf, const MotionParams& mp) {
     const size_t nb = (size_t)mf.bw * mf.bh;
     if (mp.halfPel) {
         mf.fx.assign(nb, 0.f);
@@ -444,6 +452,35 @@ inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, cons
     }
     mf.sse.assign(nb, 0.f);
     mf.var.assign(nb, 0.f);
+}
+
+// Decision for block i from its sums: sums[k] is the summed squared luma
+// error of candidate k (only k = 0 without half-pel), m and m2 the sums of
+// luma and squared luma of the block, cnt its pixel count.
+inline void refineBlock(MotionField& mf, const MotionParams& mp, int i, const float* sums, float m, float m2,
+                        float cnt) {
+    float vx = (float)mf.dx[i], vy = (float)mf.dy[i];
+    float best = sums[0] / cnt;
+    if (mp.halfPel) {
+        const float cx = vx, cy = vy;
+        for (int k = 1; k < kRefineCandidates; ++k) {
+            int ox, oy;
+            refineOffset(k, ox, oy);
+            const float e = sums[k] / cnt;
+            if (e < best) { best = e; vx = cx + 0.5f * ox; vy = cy + 0.5f * oy; }
+        }
+        mf.fx[i] = vx;
+        mf.fy[i] = vy;
+    }
+    m /= cnt;
+    mf.sse[i] = best;
+    mf.var[i] = std::max(0.f, m2 / cnt - m * m);
+}
+
+// Half-pel refinement and per-block statistics (sse, var) on full-res luma.
+inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, const MotionParams& mp, MotionField& mf,
+                        const ParallelFor& pf) {
+    prepareRefine(mf, mp);
     // prev luma sampled at +0.5 px in x, y and both: every half-pel
     // candidate then reads a plane instead of interpolating. Values are
     // computed with bilinearLuma itself, so they are bit-identical.
@@ -476,7 +513,7 @@ inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, cons
                 const int x0 = bx * mf.block, y0 = by * mf.block;
                 const int x1 = std::min(x0 + mf.block, curW), y1 = std::min(y0 + mf.block, curH);
                 const float cnt = float((x1 - x0) * (y1 - y0));
-                auto sseAt = [&](float vx, float vy) {
+                auto sseSum = [&](float vx, float vy) {
                     float s = 0.f;
                     // Split v into an integer offset and a half: x + v == (x + ix) + hx exactly.
                     const int ix = (int)std::floor(vx), iy = (int)std::floor(vy);
@@ -502,21 +539,17 @@ inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, cons
                             }
                         }
                     }
-                    return s / cnt;
+                    return s;
                 };
-                float vx = (float)mf.dx[i], vy = (float)mf.dy[i];
-                float best = sseAt(vx, vy);
-                if (mp.halfPel) {
-                    const float cx = vx, cy = vy;
-                    for (int oy = -1; oy <= 1; ++oy)
-                        for (int ox = -1; ox <= 1; ++ox) {
-                            if (!ox && !oy) continue;
-                            const float e = sseAt(cx + 0.5f * ox, cy + 0.5f * oy);
-                            if (e < best) { best = e; vx = cx + 0.5f * ox; vy = cy + 0.5f * oy; }
-                        }
-                    mf.fx[i] = vx;
-                    mf.fy[i] = vy;
-                }
+                const float cx = (float)mf.dx[i], cy = (float)mf.dy[i];
+                float sums[kRefineCandidates] = {};
+                sums[0] = sseSum(cx, cy);
+                if (mp.halfPel)
+                    for (int k = 1; k < kRefineCandidates; ++k) {
+                        int ox, oy;
+                        refineOffset(k, ox, oy);
+                        sums[k] = sseSum(cx + 0.5f * ox, cy + 0.5f * oy);
+                    }
                 float m = 0.f, m2 = 0.f;
                 for (int y = y0; y < y1; ++y)
                     for (int x = x0; x < x1; ++x) {
@@ -524,9 +557,7 @@ inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, cons
                         m += l;
                         m2 += l * l;
                     }
-                m /= cnt;
-                mf.sse[i] = best;
-                mf.var[i] = std::max(0.f, m2 / cnt - m * m);
+                refineBlock(mf, mp, i, sums, m, m2, cnt);
             }
     });
 }
@@ -808,8 +839,7 @@ inline void naturalIntra(MotionField& mf, const NaturalStep& ns, const std::vect
 
 // After the step: carry the fresh marks along the motion, and fade in what
 // is still stale over the last stretch so the end of the mosh does not pop.
-inline void naturalAfter(const Image& cur, const MotionField& mf, const NaturalStep& ns, std::vector<uint8_t>& fresh,
-                         Image& acc, const ParallelFor& pf) {
+inline void naturalCarry(const MotionField& mf, const NaturalStep& ns, std::vector<uint8_t>& fresh) {
     const size_t nb = mf.intra.size();
     if (fresh.size() != nb) fresh.assign(nb, 0);
     std::vector<uint8_t> next(nb, 0);
@@ -824,8 +854,14 @@ inline void naturalAfter(const Image& cur, const MotionField& mf, const NaturalS
             if (sx >= 0 && sy >= 0 && sx < mf.bw && sy < mf.bh) next[i] = fresh[mf.index(sx, sy)];
         }
     fresh.swap(next);
+}
 
-    const float tail = smoothstep01((ns.q - 0.85f) / 0.15f);
+inline float naturalTail(const NaturalStep& ns) { return smoothstep01((ns.q - 0.85f) / 0.15f); }
+
+inline void naturalAfter(const Image& cur, const MotionField& mf, const NaturalStep& ns, std::vector<uint8_t>& fresh,
+                         Image& acc, const ParallelFor& pf) {
+    naturalCarry(mf, ns, fresh);
+    const float tail = naturalTail(ns);
     if (tail <= 0.f) return;
     pf(cur.h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -851,13 +887,13 @@ struct RefreshStep {
     int seed = 0;
 };
 
-inline void refreshStep(const Image& prev, const Image& cur, const MotionField& mf, const RefreshStep& rs,
-                        std::vector<uint8_t>& refreshed, Image& acc, const ParallelFor& pf) {
+// Per block: summed RGB difference between cur and prev over every second
+// pixel, and the number of pixels summed.
+inline void refreshActivity(const Image& prev, const Image& cur, const MotionField& mf, std::vector<float>& sums,
+                            std::vector<int>& counts, const ParallelFor& pf) {
     const size_t nb = (size_t)mf.bw * mf.bh;
-    if (refreshed.size() != nb) refreshed.assign(nb, 0);
-    if (rs.q <= 0.f || nb == 0) return;
-
-    std::vector<float> activity(nb, 0.f);
+    sums.assign(nb, 0.f);
+    counts.assign(nb, 0);
     pf(mf.bh, [&](int b0, int b1) {
         for (int by = b0; by < b1; ++by)
             for (int bx = 0; bx < mf.bw; ++bx) {
@@ -870,9 +906,23 @@ inline void refreshStep(const Image& prev, const Image& cur, const MotionField& 
                         s += std::fabs(c[0] - p[0]) + std::fabs(c[1] - p[1]) + std::fabs(c[2] - p[2]);
                         ++n;
                     }
-                activity[mf.index(bx, by)] = n ? s / float(n) : 0.f;
+                sums[mf.index(bx, by)] = s;
+                counts[mf.index(bx, by)] = n;
             }
     });
+}
+
+// How strongly acc is pulled towards cur: rate in refreshed blocks, tail in the others.
+struct RefreshPull {
+    float rate = 0.f, tail = 0.f;
+};
+
+// Picks the refreshed blocks from the activity sums (rs.q > 0).
+inline RefreshPull refreshDecide(const MotionField& mf, const RefreshStep& rs, const std::vector<float>& sums,
+                                 const std::vector<int>& counts, std::vector<uint8_t>& refreshed) {
+    const size_t nb = (size_t)mf.bw * mf.bh;
+    std::vector<float> activity(nb, 0.f);
+    for (size_t i = 0; i < nb; ++i) activity[i] = counts[i] ? sums[i] / float(counts[i]) : 0.f;
     // Spread activity over neighbouring blocks so whole regions refresh
     // together instead of a scatter of single blocks.
     std::vector<float> spread(nb, 0.f);
@@ -906,11 +956,19 @@ inline void refreshStep(const Image& prev, const Image& cur, const MotionField& 
     // Blocks still waiting for their refresh fade in over the last stretch, so
     // the final frame has nothing left to pop.
     const float tail = smoothstep01((rs.q - 0.8f) / 0.2f);
+    RefreshPull rp;
+    rp.rate = rate;
+    rp.tail = tail;
+    return rp;
+}
+
+inline void refreshBlend(const Image& cur, const MotionField& mf, const std::vector<uint8_t>& refreshed,
+                         const RefreshPull& rp, Image& acc, const ParallelFor& pf) {
     pf(cur.h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             const int by = std::min(y / mf.block, mf.bh - 1);
             for (int x = 0; x < cur.w; ++x) {
-                const float k = refreshed[mf.index(std::min(x / mf.block, mf.bw - 1), by)] ? rate : tail;
+                const float k = refreshed[mf.index(std::min(x / mf.block, mf.bw - 1), by)] ? rp.rate : rp.tail;
                 if (k <= 0.f) continue;
                 float* a = acc.at(x, y);
                 const float* c = cur.at(x, y);
@@ -918,6 +976,18 @@ inline void refreshStep(const Image& prev, const Image& cur, const MotionField& 
             }
         }
     });
+}
+
+inline void refreshStep(const Image& prev, const Image& cur, const MotionField& mf, const RefreshStep& rs,
+                        std::vector<uint8_t>& refreshed, Image& acc, const ParallelFor& pf) {
+    const size_t nb = (size_t)mf.bw * mf.bh;
+    if (refreshed.size() != nb) refreshed.assign(nb, 0);
+    if (rs.q <= 0.f || nb == 0) return;
+    std::vector<float> sums;
+    std::vector<int> counts;
+    refreshActivity(prev, cur, mf, sums, counts, pf);
+    const RefreshPull rp = refreshDecide(mf, rs, sums, counts, refreshed);
+    refreshBlend(cur, mf, refreshed, rp, acc, pf);
 }
 
 inline float refreshedShare(const std::vector<uint8_t>& refreshed) {
@@ -1011,6 +1081,24 @@ inline SliceLayout makeSlices(const ComposeParams& cp, int w, int h, float s) {
 //   Wipe:           a wipe with a ragged, macroblock-sized edge.
 //   Slice:          bands of macroblocks slide the new shot in and push the
 //                   mosh out, each band on its own schedule.
+// Settle: the blurred difference is normalised by a high percentile of a
+// sample of it (channel 0 of every fourth pixel), so a few extreme pixels do
+// not squash everything else into "already settled".
+inline float settleNorm(std::vector<float>& sample) {
+    if (sample.empty()) return 1.f;
+    const size_t k = sample.size() * 95 / 100;
+    std::nth_element(sample.begin(), sample.begin() + k, sample.end());
+    return sample[k] > 1e-4f ? 1.f / sample[k] : 1.f;
+}
+
+// Radius of the blur behind the Structure first / Colour first, Luma reveal and Settle keys.
+inline int composeBlurRadius(const ComposeParams& cp) {
+    const int block = std::max(1, cp.block);
+    if (cp.mode == Recovery::ColourFirst) return std::max(6, 2 * block);
+    if (cp.mode == Recovery::StructureFirst) return std::max(3, block);
+    return std::max(2, block / 2);
+}
+
 inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, float q, Image& out,
                     const ParallelFor& pf) {
     out.resize(to.w, to.h);
@@ -1022,7 +1110,7 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
         const bool colourFirst = cp.mode == Recovery::ColourFirst;
         // A wider blur for Colour first so the colours arrive as a wash
         // rather than as a blurry copy of the new shot.
-        const int r = colourFirst ? std::max(6, 2 * block) : std::max(3, block);
+        const int r = composeBlurRadius(cp);
         Image lowA, lowT;
         boxBlur(acc, r, lowA, pf);
         boxBlur(to, r, lowT, pf);
@@ -1075,7 +1163,7 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
 
     Image key;
     float keyNorm = 1.f;
-    if (cp.mode == Recovery::LumaReveal) boxBlur(to, std::max(2, block / 2), key, pf);
+    if (cp.mode == Recovery::LumaReveal) boxBlur(to, composeBlurRadius(cp), key, pf);
     if (cp.mode == Recovery::Settle) {
         Image diff(to.w, to.h);
         pf(to.h, [&](int y0, int y1) {
@@ -1087,17 +1175,11 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
                         (std::fabs(a[0] - t[0]) + std::fabs(a[1] - t[1]) + std::fabs(a[2] - t[2])) / 3.f;
                 }
         });
-        boxBlur(diff, std::max(2, block / 2), key, pf);
-        // Normalise by a high percentile so a few extreme pixels do not
-        // squash everything else into "already settled".
+        boxBlur(diff, composeBlurRadius(cp), key, pf);
         std::vector<float> sample;
         sample.reserve(key.px.size() / 16 + 1);
         for (size_t i = 0; i < key.px.size(); i += 16) sample.push_back(key.px[i]);
-        if (!sample.empty()) {
-            const size_t k = sample.size() * 95 / 100;
-            std::nth_element(sample.begin(), sample.begin() + k, sample.end());
-            keyNorm = sample[k] > 1e-4f ? 1.f / sample[k] : 1.f;
-        }
+        keyNorm = settleNorm(sample);
     }
 
     const float bw = 0.6f * s;           // Blocks: fade window per block

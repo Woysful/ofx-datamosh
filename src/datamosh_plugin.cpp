@@ -42,6 +42,7 @@
 #include "ofxProperty.h"
 
 #include "mosh_core.h"
+#include "mosh_gpu.h"
 
 #define PLUGIN_ID "com.github.ofxdatamosh.Datamosh"
 #define PLUGIN_VERSION_MAJOR 1
@@ -84,6 +85,7 @@ const char* kMaxSteps = "maxSteps";         // int
 const char* kClamp = "clampLevels";         // bool
 const char* kSeed = "seed";                 // int
 const char* kView = "view";                 // choice: result / motion vectors / diagnostics
+const char* kDevice = "renderDevice";       // choice: auto / CPU / CUDA / OpenCL (mosh_gpu::Preference)
 const char* kPresetName = "presetName";     // string
 const char* kPresetSave = "presetSave";     // push button
 const char* kPresetList = "presetList";     // choice: saved presets
@@ -461,6 +463,7 @@ struct Settings {
     bool clampLevels = true;
     int seed = 0;
     int view = 0;
+    int device = 0;  // mosh_gpu::Preference; results are the same on every device
 };
 
 static Settings readSettings(OfxParamSetHandle ps, double t) {
@@ -495,6 +498,7 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.clampLevels = getInt(ps, P::kClamp, t, 1) != 0;
     s.seed = getInt(ps, P::kSeed, t, 0);
     s.view = getInt(ps, P::kView, t, 0);
+    s.device = std::min(std::max(getInt(ps, P::kDevice, t, 0), 0), 3);
     return s;
 }
 
@@ -557,11 +561,17 @@ struct Instance {
     static constexpr size_t kAccEntries = 2;
     static constexpr size_t kMaxDiffs = 100000;
 
+    ~Instance() { mosh_gpu::forget(this); }
+
     void clear() {
-        std::lock_guard<std::mutex> g(m);
-        pairDiff.clear();
-        accCache.clear();
-        frame.reset();
+        {
+            std::lock_guard<std::mutex> g(m);
+            pairDiff.clear();
+            accCache.clear();
+            frame.reset();
+        }
+        // Outside m: a GPU render holds the GPU while it takes m.
+        mosh_gpu::forget(this);
     }
     FramePtr getFrame(double t, const OfxRectI& r) {
         std::lock_guard<std::mutex> g(m);
@@ -1014,6 +1024,17 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
               "Upper bound on frame pairs analysed per output frame when the cache is cold. Lower is faster; "
               "motion is then sampled at a coarser stride.",
               48, 1, 240);
+    {
+        OfxPropertySetHandle p = defineParam(
+            ps, kOfxParamTypeChoice, P::kDevice, "Render Device",
+            "Where the mosh is computed. The result is the same on every device. Auto uses an NVIDIA GPU through "
+            "CUDA, or another GPU through OpenCL, and the CPU when there is none. Diagnostics shows the device used "
+            "and why the GPU was not.");
+        const char* opts[] = {"Auto (GPU if available)", "CPU", "GPU: CUDA (NVIDIA)", "GPU: OpenCL (AMD, Intel, NVIDIA)"};
+        for (int i = 0; i < 4; ++i) gProp->propSetString(p, kOfxParamPropChoiceOption, i, opts[i]);
+        gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
+        gProp->propSetInt(p, kOfxParamPropAnimates, 0, 0);
+    }
     defineChoice(ps, P::kView, "View", "Debug views: the motion vectors used for the current frame, or numbers.",
                  {"Result", "Motion vectors", "Diagnostics"}, 0);
     gGroup = nullptr;
@@ -1604,6 +1625,7 @@ struct ChainResult {
     bool fromCache = false;
     bool aborted = false;
     std::vector<uint8_t> refreshed;  // Motion refresh state, carried along the chain
+    std::string device;              // where it was computed, for Diagnostics
 };
 
 // Source frames for one render, converted to the output's pixel rectangle.
@@ -1625,10 +1647,11 @@ struct FrameSource {
     }
 };
 
-// Runs motion steps over frames `times` on top of acc.
-static void runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Plan& pl,
+// Runs motion steps over frames `times` on top of acc, or on top of the
+// GPU's accumulated picture when gpu is set. Returns false on a GPU error.
+static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Plan& pl,
                      const std::vector<double>& times, mosh::Image& acc, ChainResult& cr,
-                     const mosh::ParallelFor& pf) {
+                     const mosh::ParallelFor& pf, mosh_gpu::Session* gpu = nullptr) {
     const Settings& s = pl.s;
     const bool refresh = (mosh::Recovery)s.recoverMode == mosh::Recovery::MotionRefresh;
     mosh::RefreshStep rs;
@@ -1647,10 +1670,10 @@ static void runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
     ns.seed = s.seed;
     const mosh::MotionParams mp = motionParams(s);
 
-    if (times.size() < 2) return;
+    if (times.size() < 2) return true;
     mosh::Image scratch;
     FramePtr prev = fs.get(times[0]);
-    if (!prev) return;
+    if (!prev) return true;
     for (size_t i = 1; i < times.size(); ++i) {
         FramePtr cur = fs.get(times[i]);
         if (!cur) break;
@@ -1659,22 +1682,98 @@ static void runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
             break;
         }
         if (i == 1) cr.firstPairDiff = meanAbsDiff(*prev, *cur);
-        cr.lastField = mosh::estimateMotion(*prev, *cur, mp, pf);
+        mosh::MotionField& mf = cr.lastField;
+        if (gpu) {
+            if (!gpu->estimateMotion(prev, cur, mp, mf, pf)) return false;
+        } else {
+            mf = mosh::estimateMotion(*prev, *cur, mp, pf);
+        }
         if (natural) {
             ns.q = naturalAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
             ns.frame = std::lround(times[i]);
-            mosh::naturalIntra(cr.lastField, ns, cr.refreshed);
+            mosh::naturalIntra(mf, ns, cr.refreshed);
         }
-        mosh::moshStep(*prev, *cur, cr.lastField, sp, acc, scratch, pf);
-        if (natural) mosh::naturalAfter(*cur, cr.lastField, ns, cr.refreshed, acc, pf);
+        if (gpu) {
+            if (!gpu->moshStep(prev, cur, mf, sp)) return false;
+        } else {
+            mosh::moshStep(*prev, *cur, mf, sp, acc, scratch, pf);
+        }
+        if (natural) {
+            if (gpu) {
+                // mosh::naturalAfter, with the fresh blocks left alone.
+                mosh::naturalCarry(mf, ns, cr.refreshed);
+                const float tail = mosh::naturalTail(ns);
+                if (tail > 0.f && !gpu->pull(cur, mf, cr.refreshed, 0.f, tail)) return false;
+            } else {
+                mosh::naturalAfter(*cur, mf, ns, cr.refreshed, acc, pf);
+            }
+        }
         if (refresh) {
             rs.q = recoveryAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
-            mosh::refreshStep(*prev, *cur, cr.lastField, rs, cr.refreshed, acc, pf);
+            if (gpu) {
+                // mosh::refreshStep
+                const size_t nb = (size_t)mf.bw * mf.bh;
+                if (cr.refreshed.size() != nb) cr.refreshed.assign(nb, 0);
+                if (rs.q > 0.f && nb > 0) {
+                    std::vector<float> sums;
+                    std::vector<int> counts;
+                    if (!gpu->refreshActivity(prev, cur, mf, sums, counts)) return false;
+                    const mosh::RefreshPull rp = mosh::refreshDecide(mf, rs, sums, counts, cr.refreshed);
+                    if (!gpu->pull(cur, mf, cr.refreshed, rp.rate, rp.tail)) return false;
+                }
+            } else {
+                mosh::refreshStep(*prev, *cur, mf, rs, cr.refreshed, acc, pf);
+            }
         }
         prev = std::move(cur);
         ++cr.stepsDone;
     }
+    return true;
 }
+// The chain and the recovery on the GPU, with the same result as the CPU
+// path of render(); false on a GPU error (result and cr are then partial).
+static bool renderOnGpu(OfxImageEffectHandle inst, mosh_gpu::Session& gpu, Instance* cache, const FrameSource& fs,
+                        const Plan& pl, bool unstrided, bool composeNeeded, const mosh::ComposeParams& cp,
+                        mosh::Image& result, ChainResult& cr, const mosh::ParallelFor& pf) {
+    const uint64_t hash = chainHash(pl.s, fs.rect);
+    const double t = pl.t;
+    mosh::Image unused;
+    bool ok;
+    if (unstrided && pl.nFrames >= 1 && cache && gpu.restoreAcc(cache, t - 1.0, pl.cutFrame, hash, cr.refreshed)) {
+        cr.fromCache = true;
+        ok = runSteps(inst, fs, pl, {t - 1.0, t}, unused, cr, pf, &gpu);
+    } else if (unstrided && pl.nFrames >= 1 && cache && cache->getAcc(t - 1.0, pl.cutFrame, hash, unused, cr.refreshed)) {
+        cr.fromCache = true;
+        ok = gpu.setAcc(unused) && runSteps(inst, fs, pl, {t - 1.0, t}, unused, cr, pf, &gpu);
+    } else {
+        cr.refreshed.clear();
+        FramePtr ref = fs.get(pl.cutFrame - 1.0);
+        ok = gpu.setAcc(ref ? *ref : *fs.cur) && runSteps(inst, fs, pl, pl.times, unused, cr, pf, &gpu);
+    }
+    if (!ok) return false;
+    const bool store = cache && unstrided && !cr.aborted;
+    if (composeNeeded) {
+        if (!gpu.compose(fs.cur, cp, pl.q, result)) return false;
+    } else {
+        if (!gpu.downloadAcc(result)) return false;
+    }
+    if (store) gpu.storeAcc(cache, t, pl.cutFrame, hash, cr.refreshed);
+    return !gpu.failed();
+}
+
+// Text the diagnostics font can draw: upper case, digits, ". - :" and spaces.
+static std::string fontSafe(const std::string& s, size_t maxLen) {
+    std::string o;
+    for (char ch : s) {
+        const char u = (char)toupper((unsigned char)ch);
+        const bool okCh = (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '.' || u == '-' || u == ':';
+        if (okCh) o += u;
+        else if (!o.empty() && o.back() != ' ') o += ' ';
+    }
+    while (!o.empty() && o.back() == ' ') o.pop_back();
+    return o.size() > maxLen ? o.substr(0, maxLen) : o;
+}
+
 static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult& cr, int outW, int outH) {
     double mv = 0;
     int intra = 0;
@@ -1707,6 +1806,7 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
               ? "  REFR " + fmt("%.0f", 100.0 * mosh::refreshedShare(cr.refreshed))
               : std::string()));
     line("IMG " + fmt("%.0f", outW) + "X" + fmt("%.0f", outH) + "  BLK " + fmt("%.0f", pl.s.block));
+    line("DEV " + fontSafe(cr.device, 72));
 }
 
 static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) {
@@ -1759,9 +1859,37 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         return kOfxStatOK;
     }
 
-    mosh::Image acc;
     ChainResult cr;
     const bool unstrided = pl.steps == pl.nFrames;
+    const auto mode = (mosh::Recovery)s.recoverMode;
+    // These modes recover inside the chain; compose only matters at the very end.
+    const bool inChain = mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural;
+    const bool composeNeeded = !pl.passThrough && pl.q > 0.f && !(inChain && pl.q < 1.f);
+    mosh::ComposeParams cp;
+    cp.mode = mode;
+    cp.softness = s.recoverSoftness;
+    cp.block = s.block;
+    cp.seed = s.seed;
+    cp.invertReveal = s.revealInvert;
+    cp.direction = (mosh::Direction)s.direction;
+
+    mosh::Image result;
+    cr.device = "CPU";
+    if (!pl.passThrough && s.view != 1 && (mosh_gpu::Preference)s.device != mosh_gpu::Preference::Cpu) {
+        std::string why;
+        std::unique_ptr<mosh_gpu::Session> gpu = mosh_gpu::begin((mosh_gpu::Preference)s.device, why);
+        if (gpu && renderOnGpu(inst, *gpu, cache, fs, pl, unstrided, composeNeeded, cp, result, cr, pf)) {
+            cr.device = gpu->label();
+            gpu.reset();
+            if (s.view == 2) drawDiagnostics(result, pl, cr, out.width(), out.height());
+            out.fromImage(result, R, rw, pf);
+            return kOfxStatOK;
+        }
+        cr = ChainResult();
+        cr.device = "CPU: " + (gpu ? gpu->error() : why);
+    }
+
+    mosh::Image acc;
     uint64_t hash = 0;
     if (!pl.passThrough) {
         hash = chainHash(s, R);
@@ -1799,18 +1927,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         }
     }
 
-    mosh::Image result;
-    const auto mode = (mosh::Recovery)s.recoverMode;
-    // These modes recover inside the chain; compose only matters at the very end.
-    const bool inChain = mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural;
-    if (!pl.passThrough && pl.q > 0.f && !(inChain && pl.q < 1.f)) {
-        mosh::ComposeParams cp;
-        cp.mode = mode;
-        cp.softness = s.recoverSoftness;
-        cp.block = s.block;
-        cp.seed = s.seed;
-        cp.invertReveal = s.revealInvert;
-        cp.direction = (mosh::Direction)s.direction;
+    if (composeNeeded) {
         mosh::compose(acc, *fs.cur, cp, pl.q, result, pf);
         if (store) cache->putAcc(t, pl.cutFrame, hash, std::move(acc), cr.refreshed);
     } else {
@@ -1828,7 +1945,10 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
     OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
     try {
         if (!strcmp(action, kOfxActionLoad)) return onLoad();
-        if (!strcmp(action, kOfxActionUnload)) return kOfxStatOK;
+        if (!strcmp(action, kOfxActionUnload)) {
+            mosh_gpu::shutdown();
+            return kOfxStatOK;
+        }
         if (!strcmp(action, kOfxActionDescribe)) return describe(effect);
         if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeInContext(effect);
         if (!strcmp(action, kOfxActionCreateInstance)) return createInstance(effect);

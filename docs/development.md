@@ -129,12 +129,52 @@ Messages the plugin shows through the message suite are printed as
 `[message ...]`.
 
 `build/mosh_test` runs only the algorithm core on two raw clips.
+`MOCK_FLOAT=1` makes `mock_host` write the raw float RGBA output instead of
+rgb24, for exact comparisons between builds or devices (add
+`renderDevice=1` / `renderDevice=3` to force CPU / OpenCL).
+
+## GPU kernels
+
+The GPU path (`src/mosh_gpu.cpp`, `src/gpu_backend.cpp`) runs the
+per-pixel stages of `mosh_core.h` as kernels in `src/mosh_kernels.cl`; the
+per-block decisions stay on the CPU. One source serves both APIs: OpenCL
+drivers compile it at run time, and for CUDA it is precompiled to PTX
+(`src/mosh_kernels.ptx`, checked in) that the driver compiles for the card.
+Both are embedded in the plugin, and the CUDA and OpenCL drivers are loaded
+at run time, so building needs no GPU SDK. The kernels do the same float
+operations in the same order as the CPU code, with no fused multiply-adds
+and correctly rounded division and square roots, so the results are
+identical; keep it that way when changing either side.
+
+After editing `mosh_kernels.cl`, regenerate the PTX with NVRTC from CUDA 11
+or newer (a CUDA toolkit, or the `nvidia-cuda-nvrtc-cu11` pip package; set
+`PTXAS` to also check the result for sm_50 to sm_90):
+
+```sh
+NVRTC_INC=/usr/local/cuda/include NVRTC_LIB=/usr/local/cuda/lib64 tools/gen_ptx.sh
+```
+
+The PTX carries the SHA-256 of the `.cl` it was made from; CMake warns when
+they do not match.
+
+`build/gpu_selftest [auto|cuda|opencl] [width height]` renders a synthetic
+mosh through every recovery mode and several settings on the CPU and on the
+GPU, compares the motion fields and pictures bit for bit and prints
+`RESULT: OK` or the first differences, plus timings. On a machine without a
+GPU, an OpenCL CPU driver such as pocl runs the OpenCL path
+(`gpu_selftest opencl`). `OFX_DATAMOSH_GPU_DEVICE` picks a device by name
+here as in the plugin.
 
 ## Layout
 
 ```
 src/mosh_core.h          host-independent algorithm (motion search, mosh step, recovery)
 src/datamosh_plugin.cpp  OpenFX glue: describe, params, cut detection, caches, render
+src/mosh_gpu.cpp         GPU path: frame and result caches on the device, the GPU stages
+src/gpu_backend.cpp      CUDA driver API and OpenCL backends, loaded at run time
+src/mosh_kernels.cl      GPU kernels for CUDA and OpenCL; mosh_kernels.ptx is generated from it
+tools/gen_ptx.sh         regenerates mosh_kernels.ptx with NVRTC
+tools/gpu_selftest.cpp   compares the GPU path with the CPU bit for bit
 tools/mosh_test.cpp      offline harness for the core
 tools/mock_host.cpp      minimal OpenFX host for end-to-end plugin tests
 packaging/Info.plist     bundle metadata

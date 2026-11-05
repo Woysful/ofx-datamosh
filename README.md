@@ -63,6 +63,7 @@ does not give OpenFX transitions access to neighbouring frames.
 | Block Size | Bigger blocks look chunkier and render faster. |
 | Recovery | How the real picture comes back: like a real encoder (default), or one of ten stylised modes. |
 | Presets | Save your settings under a name and load them from a menu on any clip, in any project. |
+| Render Device | Auto renders on an NVIDIA (CUDA) or other (OpenCL) GPU when there is one, with the same result as the CPU. |
 
 Every parameter, the recovery modes with pictures, starting points for
 different looks and the Diagnostics view are described in the

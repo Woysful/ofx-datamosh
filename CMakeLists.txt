@@ -26,8 +26,18 @@ endif()
 set(BUNDLE_NAME Datamosh.ofx.bundle)
 set(BUNDLE_DIR ${CMAKE_BINARY_DIR}/${BUNDLE_NAME})
 
-add_library(Datamosh SHARED src/datamosh_plugin.cpp)
-target_include_directories(Datamosh PRIVATE ${OFX_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/src)
+# GPU kernels: OpenCL source and its PTX (tools/gen_ptx.sh), embedded in the plugin.
+set(KERNELS_EMBED ${CMAKE_BINARY_DIR}/gen/mosh_kernels_embed.h)
+add_custom_command(OUTPUT ${KERNELS_EMBED}
+  COMMAND ${CMAKE_COMMAND} -DCL=${CMAKE_SOURCE_DIR}/src/mosh_kernels.cl -DPTX=${CMAKE_SOURCE_DIR}/src/mosh_kernels.ptx
+          -DOUT=${KERNELS_EMBED} -P ${CMAKE_SOURCE_DIR}/cmake/embed_kernels.cmake
+  DEPENDS src/mosh_kernels.cl src/mosh_kernels.ptx cmake/embed_kernels.cmake
+  COMMENT "Embedding GPU kernels")
+
+add_library(Datamosh SHARED src/datamosh_plugin.cpp src/mosh_gpu.cpp src/gpu_backend.cpp ${KERNELS_EMBED})
+target_include_directories(Datamosh PRIVATE ${OFX_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/gen)
+# CUDA and OpenCL drivers are loaded at run time.
+target_link_libraries(Datamosh PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(Datamosh PROPERTIES
   PREFIX ""
   SUFFIX ".ofx"
@@ -70,6 +80,12 @@ install(DIRECTORY ${BUNDLE_DIR} DESTINATION ${OFX_PLUGIN_DIR} USE_SOURCE_PERMISS
 
 if(BUILD_TOOLS)
   find_package(Threads REQUIRED)
+  add_executable(gpu_selftest tools/gpu_selftest.cpp src/mosh_gpu.cpp src/gpu_backend.cpp ${KERNELS_EMBED})
+  target_include_directories(gpu_selftest PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(gpu_selftest PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+  if(MINGW)
+    target_link_options(gpu_selftest PRIVATE -static)
+  endif()
   add_executable(mosh_test tools/mosh_test.cpp)
   target_include_directories(mosh_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(mosh_test PRIVATE Threads::Threads)
