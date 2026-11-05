@@ -793,7 +793,7 @@ int main(int argc, char** argv) {
                     fwrite(rgbOut.data(), 1, frameBytes, fo);
                 }
                 if (tlOutImage) {
-                    std::lock_guard<std::mutex> h(gHostMutex);
+                    std::lock_guard<std::mutex> hostLock(gHostMutex);
                     for (size_t k = 0; k < out->live.size(); ++k)
                         if (out->live[k].get() == tlOutImage) { out->live.erase(out->live.begin() + (long)k); break; }
                     renderMs += ms;
@@ -843,7 +843,7 @@ int main(int argc, char** argv) {
         if (i == 1 || i == total / 2) {
             for (auto& kv : outArgs.d) {
                 printf("frame %d framesNeeded[%s]:", i, kv.first.c_str());
-                for (size_t k = 0; k + 1 < kv.second.size(); k += 2) printf(" [%.0f..%.0f]", kv.second[k], kv.second[k + 1]);
+                for (size_t r = 0; r + 1 < kv.second.size(); r += 2) printf(" [%.0f..%.0f]", kv.second[r], kv.second[r + 1]);
                 printf("\n");
             }
         }
@@ -877,7 +877,6 @@ int main(int argc, char** argv) {
             const std::vector<float>& s = out->live.back()->data;
             fwrite(s.data(), sizeof(float), s.size(), fo);
         } else if (gScale != 1.0) {  // nearest-neighbour back to full size
-            const int sw = std::max(1, (int)std::lround(w * gScale)), sh = std::max(1, (int)std::lround(h * gScale));
             const std::vector<float>& s = out->live.back()->data;
             std::vector<float> up((size_t)w * h * 4);
             for (int y = 0; y < h; ++y)

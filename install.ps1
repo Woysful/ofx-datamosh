@@ -46,7 +46,7 @@ C:\Program Files\Common Files\OFX\Plugins.
 .EXAMPLE
 .\install.ps1 -Download
 .EXAMPLE
-.\install.ps1 -Path .\dist\ofx-datamosh-v1.5.0-windows-x64.zip
+.\install.ps1 -Path .\dist\ofx-datamosh-v1.6.0-windows-x64.zip
 .EXAMPLE
 .\install.ps1 -Uninstall
 #>

@@ -54,7 +54,7 @@ version from `packaging/Info.plist`.
 ./build.sh --list              # which platforms can be built on this machine
 ./build.sh                     # all of them; the rest are skipped
 ./build.sh linux windows       # only these (fails if one cannot be built)
-./build.sh -c -q -v v1.5.0     # clean, quiet build labelled v1.5.0
+./build.sh -c -q -v v1.6.0     # clean, quiet build labelled v1.6.0
 ./build.sh -i linux            # build for Linux and install it
 ./build.sh --help              # all options
 ```
@@ -82,7 +82,7 @@ version from `packaging/Info.plist`.
 Platforms without a toolchain are skipped with a message. `dist/SHA256SUMS`
 lists the checksums of the archives. To publish, attach the files from
 `dist/` to a GitHub release, e.g.
-`gh release create v1.5.0 dist/*.zip dist/SHA256SUMS`. The installers find
+`gh release create v1.6.0 dist/*.zip dist/SHA256SUMS`. The installers find
 the archive for each OS by its name ending (`-linux-x86_64.zip`,
 `-windows-x64.zip`, `-macos-universal.zip`), so keep the names `build.sh`
 gives them.

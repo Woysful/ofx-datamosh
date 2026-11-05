@@ -46,9 +46,9 @@ Environment variables VERSION and JOBS work as defaults for -v and -j.
 Examples:
   ./build.sh                     # everything available
   ./build.sh linux windows       # only these two
-  ./build.sh -c -v v1.5.0        # clean release build labelled v1.5.0
+  ./build.sh -c -v v1.6.0        # clean release build labelled v1.6.0
   ./build.sh -i linux            # build for Linux and install it
-  gh release create v1.5.0 dist/*.zip dist/SHA256SUMS
+  gh release create v1.6.0 dist/*.zip dist/SHA256SUMS
 USAGE
 }
 

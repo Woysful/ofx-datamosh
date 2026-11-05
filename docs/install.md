@@ -26,7 +26,7 @@ ask where to take the plugin from:
 ```
 Datamosh OFX installer (linux, Linux-x86-64)
   1) local build:    build-release/linux/Datamosh.ofx.bundle (2026-11-04 22:03)
-  2) latest release: v1.5.0 from github.com/Woysful/ofx-datamosh
+  2) latest release: v1.6.0 from github.com/Woysful/ofx-datamosh
 Choose 1 or 2, q to quit [1]:
 ```
 

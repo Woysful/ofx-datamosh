@@ -52,8 +52,8 @@
 
 #define PLUGIN_ID "com.github.ofxdatamosh.Datamosh"
 #define PLUGIN_VERSION_MAJOR 1
-#define PLUGIN_VERSION_MINOR 5
-#define PLUGIN_VERSION_STRING "1.5.0"
+#define PLUGIN_VERSION_MINOR 6
+#define PLUGIN_VERSION_STRING "1.6.0"
 
 static OfxHost* gHost = nullptr;
 static OfxImageEffectSuiteV1* gEffect = nullptr;
@@ -690,7 +690,7 @@ struct Instance {
     static constexpr size_t kHeldFrames = 9;
     static constexpr size_t kFieldEntries = 32;
 
-    // Unstrided chain renders in progress. Hosts render several frames at
+    // Chain renders in progress. Hosts render several frames at
     // once during playback; a render whose nearest usable picture is an
     // earlier frame still being rendered waits for that frame instead of
     // rebuilding the chain from the cut, which costs a step and a host fetch
@@ -2265,9 +2265,8 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
 // The chain and the recovery on the GPU, with the same result as the CPU
 // path of render(); false on a GPU error (result and cr are then partial).
 static bool renderOnGpu(OfxImageEffectHandle inst, mosh_gpu::Session& gpu, Instance* cache, const FrameSource& fs,
-                        const Plan& pl, bool composeNeeded, const mosh::ComposeParams& cp,
+                        const Plan& pl, uint64_t hash, bool composeNeeded, const mosh::ComposeParams& cp,
                         mosh::Image& result, ChainResult& cr, const mosh::ParallelFor& pf) {
-    const uint64_t hash = chainHash(pl.s, fs.rect);
     const double t = pl.t;
     mosh::Image unused;
     bool ok;
@@ -2437,6 +2436,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     if (!pl.cutKnown && pl.s.cutMode == 0) detectCut(src, cache, pl, R, fs.cur, fs.prev);
 
     const Settings& s = pl.s;
+    const uint64_t hash = pl.passThrough ? 0 : chainHash(s, R);
     ChainResult cr;
     double waitedMs = 0;
     auto finish = [&]() {
@@ -2455,7 +2455,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         fs.heldFrom = pl.cutFrame - (double)pl.loopLen - 1.0;
         fs.heldTo = pl.cutFrame - 1.0;
         fs.fields = cache;
-        fs.hash = chainHash(s, R);
+        fs.hash = hash;
     }
     ChainTicket ticket;
     CheckpointPlan ck;
@@ -2463,7 +2463,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     gCheckpoints.trim(budget);
     if (cache && !pl.passThrough) {
         ticket.in = cache;
-        ticket.it = cache->enter(t, pl.cutFrame, chainHash(s, R), [&]() { return gEffect->abort(inst) != 0; }, waitedMs);
+        ticket.it = cache->enter(t, pl.cutFrame, hash, [&]() { return gEffect->abort(inst) != 0; }, waitedMs);
         fs.ticket = &ticket;
         // As many checkpoints as the budget holds over one mosh, at least
         // kMinEvery frames apart so that saving them costs little.
@@ -2473,7 +2473,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         if (fit > 0) {
             ck.owner = cache;
             ck.cut = pl.cutFrame;
-            ck.hash = chainHash(s, R);
+            ck.hash = hash;
             ck.budget = budget;
             ck.every = std::max(kMinEvery, (long)((std::max(1, s.moshLength) + fit - 1) / fit));
             fs.checkpoints = &ck;
@@ -2496,7 +2496,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     if (!pl.passThrough && s.view != 1 && (mosh_gpu::Preference)s.device != mosh_gpu::Preference::Cpu) {
         std::string why;
         std::unique_ptr<mosh_gpu::Session> gpu = mosh_gpu::begin((mosh_gpu::Preference)s.device, why);
-        if (gpu && renderOnGpu(inst, *gpu, cache, fs, pl, composeNeeded, cp, result, cr, pf)) {
+        if (gpu && renderOnGpu(inst, *gpu, cache, fs, pl, hash, composeNeeded, cp, result, cr, pf)) {
             cr.device = gpu->label();
             gpu.reset();
             ticket.done();
@@ -2509,9 +2509,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     }
 
     mosh::Image acc;
-    uint64_t hash = 0;
     if (!pl.passThrough) {
-        hash = chainHash(s, R);
         // Fast path: an earlier frame's accumulated picture is cached or
         // checkpointed, and the steps from there give exactly the same result.
         const bool reuse = pl.steps >= 1 && cache;
@@ -2590,7 +2588,7 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
                 gProp->propGetString(inArgs, kOfxPropName, 0, &name);
                 gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
             }
-            // Checkpoint Memory changes no picture, so the caches stay.
+            // Jump Cache size changes no picture, so the caches stay.
             const bool noRender = name && (!strcmp(name, P::kPresetName) || !strcmp(name, P::kPresetSave) ||
                                            !strcmp(name, P::kCheckpointMB) ||
                                            !strcmp(name, P::kPresetList) || !strcmp(name, P::kPresetLoad) ||
