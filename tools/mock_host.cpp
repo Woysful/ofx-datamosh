@@ -43,7 +43,10 @@ static void setAt(std::vector<T>& v, int idx, const T& val) {
 }
 
 static OfxStatus propSetPointer(OfxPropertySetHandle h, const char* n, int idx, void* v) { setAt(PS(h)->p[n], idx, v); return kOfxStatOK; }
-static OfxStatus propSetString(OfxPropertySetHandle h, const char* n, int idx, const char* v) { setAt(PS(h)->s[n], idx, std::string(v)); return kOfxStatOK; }
+static bool gFixedChoices = false;  // MOCK_FIXED_CHOICES: menus cannot grow after describeInContext
+static OfxStatus propSetString(OfxPropertySetHandle h, const char* n, int idx, const char* v) {
+    if (gFixedChoices && !strcmp(n, kOfxParamPropChoiceOption) && idx >= (int)PS(h)->s[n].size()) return kOfxStatErrBadIndex;
+    setAt(PS(h)->s[n], idx, std::string(v)); return kOfxStatOK; }
 static OfxStatus propSetDouble(OfxPropertySetHandle h, const char* n, int idx, double v) { setAt(PS(h)->d[n], idx, v); return kOfxStatOK; }
 static OfxStatus propSetInt(OfxPropertySetHandle h, const char* n, int idx, int v) { setAt(PS(h)->i[n], idx, v); return kOfxStatOK; }
 static OfxStatus propSetPointerN(OfxPropertySetHandle h, const char* n, int c, void* const* v) { for (int k = 0; k < c; ++k) propSetPointer(h, n, k, v[k]); return kOfxStatOK; }
@@ -67,7 +70,9 @@ static OfxStatus propGetPointerN(OfxPropertySetHandle h, const char* n, int c, v
 static OfxStatus propGetStringN(OfxPropertySetHandle h, const char* n, int c, char** v) { for (int k = 0; k < c; ++k) if (propGetString(h, n, k, &v[k]) != kOfxStatOK) return kOfxStatErrUnknown; return kOfxStatOK; }
 static OfxStatus propGetDoubleN(OfxPropertySetHandle h, const char* n, int c, double* v) { for (int k = 0; k < c; ++k) if (propGetDouble(h, n, k, &v[k]) != kOfxStatOK) return kOfxStatErrUnknown; return kOfxStatOK; }
 static OfxStatus propGetIntN(OfxPropertySetHandle h, const char* n, int c, int* v) { for (int k = 0; k < c; ++k) if (propGetInt(h, n, k, &v[k]) != kOfxStatOK) return kOfxStatErrUnknown; return kOfxStatOK; }
-static OfxStatus propReset(OfxPropertySetHandle h, const char* n) { PS(h)->s.erase(n); PS(h)->d.erase(n); PS(h)->i.erase(n); PS(h)->p.erase(n); return kOfxStatOK; }
+static OfxStatus propReset(OfxPropertySetHandle h, const char* n) {
+    if (gFixedChoices && !strcmp(n, kOfxParamPropChoiceOption)) return kOfxStatErrUnsupported;
+    PS(h)->s.erase(n); PS(h)->d.erase(n); PS(h)->i.erase(n); PS(h)->p.erase(n); return kOfxStatOK; }
 static OfxStatus propGetDimension(OfxPropertySetHandle h, const char* n, int* c) {
     PropSet* p = PS(h); *c = 0;
     if (p->s.count(n)) *c = (int)p->s[n].size(); else if (p->d.count(n)) *c = (int)p->d[n].size();
@@ -86,6 +91,7 @@ struct Param {
     PropSet props;
     double dval = 0;
     int ival = 0;
+    std::string sval;
     bool isTransition = false;
     std::vector<double> keys;  // MOCK_KEYS: keyframe times; each key toggles an int/bool value
 };
@@ -123,6 +129,8 @@ static OfxStatus paramGetValueAtTime(OfxParamHandle ph, OfxTime t, ...) {
     if (p->type == kOfxParamTypeDouble) {
         double* out = va_arg(ap, double*);
         *out = p->isTransition ? std::min(1.0, std::max(0.0, (t - gT0) / gDur)) : p->dval;
+    } else if (p->type == kOfxParamTypeString) {
+        *va_arg(ap, char**) = const_cast<char*>(p->sval.c_str());
     } else {
         int* out = va_arg(ap, int*);
         int flips = 0;
@@ -147,7 +155,9 @@ static OfxStatus paramGetKeyTime(OfxParamHandle ph, unsigned int i, OfxTime* t) 
 static OfxStatus paramGetValue(OfxParamHandle ph, ...) {
     Param* p = reinterpret_cast<Param*>(ph);
     va_list ap; va_start(ap, ph);
-    if (p->type == kOfxParamTypeDouble) *va_arg(ap, double*) = p->dval; else *va_arg(ap, int*) = p->ival;
+    if (p->type == kOfxParamTypeDouble) *va_arg(ap, double*) = p->dval;
+    else if (p->type == kOfxParamTypeString) *va_arg(ap, char**) = const_cast<char*>(p->sval.c_str());
+    else *va_arg(ap, int*) = p->ival;
     va_end(ap);
     return kOfxStatOK;
 }
@@ -155,7 +165,9 @@ static OfxStatus unsupported(...) { return kOfxStatErrUnsupported; }
 static OfxStatus paramSetValue(OfxParamHandle ph, ...) {
     Param* p = reinterpret_cast<Param*>(ph);
     va_list ap; va_start(ap, ph);
-    if (p->type == kOfxParamTypeDouble) p->dval = va_arg(ap, double); else p->ival = va_arg(ap, int);
+    if (p->type == kOfxParamTypeDouble) p->dval = va_arg(ap, double);
+    else if (p->type == kOfxParamTypeString) p->sval = va_arg(ap, const char*);
+    else p->ival = va_arg(ap, int);
     va_end(ap);
     return kOfxStatOK;
 }
@@ -380,6 +392,7 @@ int main(int argc, char** argv) {
     CHECK(pl->mainEntry(kOfxImageEffectActionDescribeInContext, &inst, H(&dicArgs), nullptr), "describeInContext");
     printf("clips:");
     for (auto& c : inst.clips) printf(" %s", c.first.c_str());
+    gFixedChoices = getenv("MOCK_FIXED_CHOICES") != nullptr;
     printf("\nparams (%zu):", inst.params.params.size());
     for (auto& p : inst.params.params) printf(" %s", p.first.c_str());
     printf("\n");
@@ -388,6 +401,7 @@ int main(int argc, char** argv) {
     for (auto& kv : inst.params.params) {
         Param& p = *kv.second;
         if (p.type == kOfxParamTypeDouble) { auto it = p.props.d.find(kOfxParamPropDefault); p.dval = it != p.props.d.end() ? it->second[0] : 0.0; }
+        else if (p.type == kOfxParamTypeString) { auto it = p.props.s.find(kOfxParamPropDefault); p.sval = it != p.props.s.end() ? it->second[0] : ""; }
         else { auto it = p.props.i.find(kOfxParamPropDefault); p.ival = it != p.props.i.end() ? it->second[0] : 0; }
     }
     {
@@ -400,6 +414,7 @@ int main(int argc, char** argv) {
         auto it = eq ? inst.params.params.find(std::string(argv[a], eq - argv[a])) : inst.params.params.end();
         if (it == inst.params.params.end()) { fprintf(stderr, "unknown param override: %s\n", argv[a]); return 1; }
         if (it->second->type == kOfxParamTypeDouble) it->second->dval = atof(eq + 1);
+        else if (it->second->type == kOfxParamTypeString) it->second->sval = eq + 1;
         else it->second->ival = atoi(eq + 1);
     }
 
@@ -439,7 +454,7 @@ int main(int argc, char** argv) {
         c->props.s[kOfxImageEffectPropPixelDepth] = {kOfxBitDepthFloat};
     }
     CHECK(pl->mainEntry(kOfxActionCreateInstance, &inst, nullptr, nullptr), "createInstance");
-    if (getenv("MOCK_PRESETS")) {  // save to a slot, change, load back (OFX_DATAMOSH_PRESETS: file)
+    if (getenv("MOCK_PRESETS")) {  // save, pick, load, delete named presets (OFX_DATAMOSH_PRESETS: file)
         auto& P = inst.params.params;
         auto press = [&](const char* name) {
             PropSet ic;
@@ -449,23 +464,57 @@ int main(int argc, char** argv) {
             if (st != kOfxStatOK) printf("instanceChanged(%s) failed: %d\n", name, st);
         };
         auto show = [&](const char* what) {
-            printf("%s: residual=%.3f recoverMode=%d blockSize=%d seed=%d moshStyle=%d cutMode=%d cutFrame=%d view=%d intraRate.enabled=%d\n",
+            printf("%s: residual=%.3f recoverMode=%d blockSize=%d seed=%d moshStyle=%d cutMode=%d cutThreshold=%.3f cutFrame=%d view=%d intraRate.enabled=%d\n",
                    what, P["residual"]->dval, P["recoverMode"]->ival, P["blockSize"]->ival, P["seed"]->ival,
-                   P["moshStyle"]->ival, P["cutMode"]->ival, P["cutFrame"]->ival, P["view"]->ival,
+                   P["moshStyle"]->ival, P["cutMode"]->ival, P["cutThreshold"]->dval, P["cutFrame"]->ival, P["view"]->ival,
                    P["intraRate"]->props.i[kOfxParamPropEnabled][0]);
         };
+        auto menu = [&]() {
+            printf("  menu:");
+            for (auto& o : P["presetList"]->props.s[kOfxParamPropChoiceOption]) printf(" [%s]", o.c_str());
+            printf("  pick=%d name=\"%s\"\n", P["presetList"]->ival, P["presetName"]->sval.c_str());
+        };
+        auto pick = [&](int idx) { P["presetList"]->ival = idx; press("presetList"); };
+        menu();
         P["residual"]->dval = 0.3; P["recoverMode"]->ival = 4; P["blockSize"]->ival = 2; P["seed"]->ival = 7;
-        P["moshStyle"]->ival = 1; P["cutMode"]->ival = 1; P["cutFrame"]->ival = 1010; P["presetSlot"]->ival = 1;
-        show("before save (slot 2)");
+        P["moshStyle"]->ival = 1; P["cutMode"]->ival = 1; P["cutFrame"]->ival = 1010; P["cutThreshold"]->dval = 0.3;
+        printf("== save without a name\n");
         press("presetSave");
+        printf("== save \"  My [look]  \"\n");
+        P["presetName"]->sval = "  My [look]  ";
+        press("presetSave");
+        menu();
+        printf("== save \"Second\"\n");
+        P["residual"]->dval = 0.5; P["cutMode"]->ival = 0; P["cutThreshold"]->dval = 0.2;
+        P["presetName"]->sval = "Second";
+        press("presetSave");
+        menu();
         P["residual"]->dval = 0.9; P["recoverMode"]->ival = 0; P["blockSize"]->ival = 1; P["seed"]->ival = 0;
-        P["moshStyle"]->ival = 0; P["cutMode"]->ival = 0; P["cutFrame"]->ival = 0; P["view"]->ival = 2;
+        P["moshStyle"]->ival = 0; P["cutMode"]->ival = 2; P["cutThreshold"]->dval = 0.5; P["cutFrame"]->ival = 0; P["view"]->ival = 2;
+        P["presetName"]->sval = "";
         show("changed");
+        printf("== pick 1, load\n");
+        pick(1);
+        menu();
         press("presetLoad");
-        show("after load (slot 2)");
-        P["presetSlot"]->ival = 3;
+        show("after load");
+        printf("== pick 2, load\n");
+        pick(2);
         press("presetLoad");
-        show("after load of empty slot 4");
+        show("after load");
+        printf("== pick 1, delete, then load 1\n");
+        pick(1);
+        press("presetDelete");
+        menu();
+        P["presetList"]->ival = 1;
+        press("presetLoad");
+        printf("== load with nothing picked\n");
+        P["presetList"]->ival = 0;
+        press("presetLoad");
+        printf("== save \"My  look\" again (restores the entry)\n");
+        P["presetName"]->sval = "My  look";
+        press("presetSave");
+        menu();
         return 0;
     }
     if (getenv("MOCK_PARAMS")) {  // dump parameter layout: group, enabled state

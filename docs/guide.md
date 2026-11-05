@@ -42,9 +42,8 @@ same thing in software, per frame:
 
 The parameters are split into groups in the inspector. Parameters that do
 nothing with the current settings are greyed out (Cut Frame in Auto mode,
-Dark Areas First outside Luma-keyed refresh, and so on). The first two groups
-are closed by default: **How to use** holds a short version of the Resolve
-quick start from the README, **Presets** saves and loads your own settings
+Dark Areas First outside Luma-keyed refresh, and so on). The first group,
+**Presets**, is closed by default; it saves and loads your own settings
 (see [Presets](#presets)).
 
 The menu entries use codec terms. Version 1.4 had only three recovery
@@ -56,9 +55,10 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Here, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). |
+| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Markers, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). |
 | Cut Frame | 0 | Manual mode: first frame of the new shot, in the clip's own frame numbers (Diagnostics shows `T`). |
-| Cut Here | off | Keyframes mode: every keyframe of this parameter is a cut. || Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
+| Cut Markers | Place keyframe on cut | Keyframes mode: every keyframe of this parameter is a cut. The menu has one entry; only the keyframes matter. |
+| Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 
 **Mosh**
 
@@ -147,11 +147,12 @@ values you changed stay. Every Recovery mode works with both styles.
 
 Auto finds every hard cut in the clip by itself. When you want to pick the
 cuts yourself (only some of them, or a cut Auto does not see), set **Cut**
-to **Keyframes (Cut Here)** and mark the cuts with keyframes of **Cut Here**:
+to **Keyframes (Cut Markers)** and mark the cuts with keyframes of **Cut
+Markers**:
 
 1. Move the playhead to the first frame of the new shot.
-2. Click the keyframe button next to Cut Here. The value of the checkbox
-   does not matter, only where the keyframes are.
+2. Click the keyframe button next to Cut Markers. Its menu has a single
+   entry, "Place keyframe on cut"; only where the keyframes are matters.
 3. Repeat for every cut you want moshed.
 
 To move a cut, drag its keyframe; to drop a cut, delete its keyframe. Only
@@ -160,21 +161,36 @@ on the very first frame of the clip is ignored, because there is no old
 picture before it. Diagnostics shows `KEYS n`, the number of keyframes the
 plugin sees.
 
-Some hosts do not tell plugins where keyframes are (Diagnostics then shows
-`KEYS UNKNOWN`). There a cut is the frame where the value of Cut Here
-changes, so toggle the checkbox at each cut instead.
+Some hosts do not tell plugins where keyframes are. There Diagnostics shows
+`KEYS UNKNOWN` and Keyframes mode finds no cut; use Auto or Manual frame
+instead.
 
 ## Presets
 
 DaVinci Resolve has no way to save the settings of an OpenFX effect as a
-preset, so the plugin has its own: open the **Presets** group, pick a
-**Slot** (User 1 to User 4), and press **Save to Slot**. On another clip, in
-any project, pick the slot and press **Load from Slot**.
+preset, so the plugin has its own. Open the **Presets** group:
 
-A preset holds every setting except Cut Detection (that belongs to the clip)
-and View. Saving replaces what the slot held before. The slots are kept in
-`presets.ini` in your user settings folder, which you can copy to another
-machine or edit by hand:
+* **Save**: type a name in **Preset Name** and press **Save Preset**. Saving
+  under a name that already exists replaces that preset.
+* **Load**: pick the preset in **Saved Presets** and press **Load Preset**.
+  This works on any clip, in any project.
+* **Delete**: pick the preset in **Saved Presets** and press **Delete
+  Preset**. The entry stays in the menu marked "(deleted)" until the host
+  restarts.
+
+Picking a preset in Saved Presets also puts its name into Preset Name, so
+Save Preset then updates the picked preset. There is no limit on the number
+of presets.
+
+A preset holds every setting, including Cut mode and Cut Threshold, except
+Cut Frame and the Cut Markers keyframes (those belong to one clip) and View.
+Some hosts read the Saved Presets menu only once per session. There a newly
+saved preset appears in the menu after the host restarts; the plugin says so
+when you save. Presets saved in another project or another running copy of
+the host appear in the menu after a restart too.
+
+The presets are kept in `presets.ini` in your user settings folder, which
+you can copy to another machine or edit by hand:
 
 | OS | File |
 |---|---|
@@ -184,7 +200,7 @@ machine or edit by hand:
 
 The environment variable `OFX_DATAMOSH_PRESETS` overrides the path.
 
-Without the plugin's slots, Resolve itself can still carry settings over:
+Without the plugin's presets, Resolve itself can still carry settings over:
 on the Edit page copy the clip, then on the target clip use **Paste
 Attributes** (Alt+V) and tick Plugins; on the Color page save the node as a
 still or PowerGrade.

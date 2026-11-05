@@ -60,7 +60,7 @@ static OfxMessageSuiteV1* gMessage = nullptr;  // optional
 namespace P {
 const char* kCutMode = "cutMode";           // choice: auto / manual / keyframes
 const char* kCutFrame = "cutFrame";         // int
-const char* kCutHere = "cutHere";           // bool, keyframes mark cuts
+const char* kCutMarker = "cutMarker";       // one-entry choice, keyframes mark cuts
 const char* kCutThreshold = "cutThreshold"; // double
 const char* kMoshLength = "moshLength";     // int frames
 const char* kBlockSize = "blockSize";       // choice: 8/16/32/64
@@ -84,11 +84,12 @@ const char* kMaxSteps = "maxSteps";         // int
 const char* kClamp = "clampLevels";         // bool
 const char* kSeed = "seed";                 // int
 const char* kView = "view";                 // choice: result / motion vectors / diagnostics
-const char* kPresetSlot = "presetSlot";     // choice: User 1..4
+const char* kPresetName = "presetName";     // string
 const char* kPresetSave = "presetSave";     // push button
+const char* kPresetList = "presetList";     // choice: saved presets
 const char* kPresetLoad = "presetLoad";     // push button
+const char* kPresetDelete = "presetDelete"; // push button
 
-const char* kGrpHelp = "grpHelp";
 const char* kGrpPresets = "grpPresets";
 const char* kGrpCut = "grpCut";
 const char* kGrpMosh = "grpMosh";
@@ -101,7 +102,6 @@ static const int kDefaultRecovery = (int)mosh::Recovery::Natural;
 static const int kStylePOnly = 1;
 static const int kCutManual = 1;
 static const int kCutKeyframes = 2;
-static const int kPresetSlots = 4;
 
 struct StyleDefaults {
     double residual;
@@ -194,17 +194,6 @@ static void defineChoice(OfxParamSetHandle ps, const char* name, const char* lab
     OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, name, label, hint);
     for (size_t i = 0; i < options.size(); ++i) gProp->propSetString(p, kOfxParamPropChoiceOption, (int)i, options[i]);
     gProp->propSetInt(p, kOfxParamPropDefault, 0, def);
-}
-
-// Read-only line of text. Not saved with the project, so a newer plugin
-// version shows its own text in old projects too.
-static void defineText(OfxParamSetHandle ps, const char* name, const char* label, const char* text) {
-    OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeString, name, label, text);
-    gProp->propSetString(p, kOfxParamPropStringMode, 0, kOfxParamStringIsLabel);
-    gProp->propSetString(p, kOfxParamPropDefault, 0, text);
-    gProp->propSetInt(p, kOfxParamPropAnimates, 0, 0);
-    gProp->propSetInt(p, kOfxParamPropPersistant, 0, 0);
-    gProp->propSetInt(p, kOfxParamPropEvaluateOnChange, 0, 0);
 }
 
 static double getDouble(OfxParamSetHandle ps, const char* name, double t, double fallback) {
@@ -691,7 +680,7 @@ struct Plan {
     std::vector<double> times;  // steps + 1 frames, ascending, times[0] == cutFrame
     float q = 0.f;              // recovery progress
     bool passThrough = true;    // output == source
-    int cutKeys = 0;            // keyframes of Cut Here, -1: host does not report them
+    int cutKeys = 0;            // keyframes of Cut Markers, -1: host does not report them
 };
 
 static void finishPlan(Plan& pl) {
@@ -711,14 +700,12 @@ static void finishPlan(Plan& pl) {
     }
 }
 
-// Keyframes mode: the most recent keyframe of Cut Here at or before t is the
-// first frame of the new shot. A keyframe on the clip's first frame has no
-// old picture before it and is skipped, so a key set there to start the
-// animation does not count. Hosts that do not report keyframes: the most
-// recent frame where the value of Cut Here changes.
+// Keyframes mode: the most recent keyframe of Cut Markers at or before t is
+// the first frame of the new shot. A keyframe on the clip's first frame has
+// no old picture before it and is skipped.
 static void keyframeCut(OfxImageEffectHandle inst, OfxParamSetHandle ps, Plan& pl) {
     OfxParamHandle h = nullptr;
-    if (!ps || gParam->paramGetHandle(ps, P::kCutHere, &h, nullptr) != kOfxStatOK || !h) return;
+    if (!ps || gParam->paramGetHandle(ps, P::kCutMarker, &h, nullptr) != kOfxStatOK || !h) return;
     double first = -1e300;
     OfxImageClipHandle src = nullptr;
     OfxPropertySetHandle cp = nullptr;
@@ -743,21 +730,6 @@ static void keyframeCut(OfxImageEffectHandle inst, OfxParamSetHandle ps, Plan& p
         return;
     }
     pl.cutKeys = -1;
-    int v = 0;
-    gParam->paramGetValueAtTime(h, pl.t, &v);
-    const int L = std::max(1, pl.s.moshLength);
-    for (int k = 0; k < L; ++k) {
-        const double ft = pl.t - k;
-        if (ft - 1.0 < first - eps) break;
-        int pv = v;
-        gParam->paramGetValueAtTime(h, ft - 1.0, &pv);
-        if ((pv != 0) != (v != 0)) {
-            pl.cutKnown = true;
-            pl.cutFrame = ft;
-            return;
-        }
-        v = pv;
-    }
 }
 static Plan makePlan(OfxImageEffectHandle inst, double t) {
     Plan pl;
@@ -875,6 +847,8 @@ static void defineClip(OfxImageEffectHandle effect, const char* name, bool tempo
     if (temporal) gProp->propSetInt(cp, kOfxImageEffectPropTemporalClipAccess, 0, 1);
 }
 
+static std::vector<std::string> presetMenu(bool sync);
+
 static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     defineClip(effect, kOfxImageEffectSimpleSourceClipName, true);
     defineClip(effect, kOfxImageEffectOutputClipName, false);
@@ -882,46 +856,60 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(effect, &ps);
 
-    beginGroup(ps, P::kGrpHelp, "How to use",
-               "Short instructions. Full guide: https://github.com/Woysful/ofx-datamosh", false);
-    defineText(ps, "help1", "1.", "Put the two shots next to each other (a cut).");
-    defineText(ps, "help2", "2.", "Select both > right-click > New Compound Clip.");
-    defineText(ps, "help3", "3.", "Apply Datamosh to the compound clip.");
-    defineText(ps, "help4", "4.", "The cut is found by itself; set Mosh Length.");
-    defineText(ps, "help5", "No effect?", "It sees no cut: not on a single shot, not as a transition.");
-    defineText(ps, "help6", "Guide", "github.com/Woysful/ofx-datamosh");
-
     beginGroup(ps, P::kGrpPresets, "Presets",
-               "Save all settings except Cut Detection and View to one of four slots and load them on any clip, "
-               "in any project. The slots are stored in a file in your user settings folder.",
+               "Save your settings under a name and load them on any clip, in any project. A preset holds "
+               "everything except Cut Frame, the cut keyframes and View. Presets are stored in presets.ini in "
+               "your user settings folder.",
                false);
     {
-        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kPresetSlot, "Slot",
-                                             "Which preset slot Save and Load use.");
-        for (int i = 0; i < kPresetSlots; ++i)
-            gProp->propSetString(p, kOfxParamPropChoiceOption, i, ("User " + std::to_string(i + 1)).c_str());
-        gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeString, P::kPresetName, "Preset Name",
+                                             "Name for Save Preset. Picking a saved preset below fills it in, so "
+                                             "Save Preset then updates that preset.");
+        gProp->propSetString(p, kOfxParamPropStringMode, 0, kOfxParamStringIsSingleLine);
+        gProp->propSetString(p, kOfxParamPropDefault, 0, "");
         gProp->propSetInt(p, kOfxParamPropAnimates, 0, 0);
         gProp->propSetInt(p, kOfxParamPropEvaluateOnChange, 0, 0);
     }
-    defineParam(ps, kOfxParamTypePushButton, P::kPresetSave, "Save to Slot",
-                "Store the current settings in the selected slot, replacing what was there.");
-    defineParam(ps, kOfxParamTypePushButton, P::kPresetLoad, "Load from Slot",
-                "Set all parameters stored in the selected slot. Cut Detection and View stay as they are.");
+    defineParam(ps, kOfxParamTypePushButton, P::kPresetSave, "Save Preset",
+                "Save the current settings under Preset Name. A preset with the same name is replaced.");
+    {
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kPresetList, "Saved Presets",
+                                             "Presets saved so far. Presets saved in another project or "
+                                             "another host session appear after the host restarts.");
+        const std::vector<std::string> names = presetMenu(true);
+        for (size_t i = 0; i < names.size(); ++i)
+            gProp->propSetString(p, kOfxParamPropChoiceOption, (int)i, names[i].c_str());
+        gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
+        gProp->propSetInt(p, kOfxParamPropAnimates, 0, 0);
+        gProp->propSetInt(p, kOfxParamPropEvaluateOnChange, 0, 0);
+        // A stored index could name another preset once the file changes.
+        gProp->propSetInt(p, kOfxParamPropPersistant, 0, 0);
+    }
+    defineParam(ps, kOfxParamTypePushButton, P::kPresetLoad, "Load Preset",
+                "Set the parameters stored in the preset picked in Saved Presets.");
+    defineParam(ps, kOfxParamTypePushButton, P::kPresetDelete, "Delete Preset",
+                "Remove the preset picked in Saved Presets from the presets file.");
+
     beginGroup(ps, P::kGrpCut, "Cut Detection", "Where the keyframe goes missing.", true);
     defineChoice(ps, P::kCutMode, "Cut",
                  "Where the keyframe goes missing. Auto looks back for the most recent hard cut in the clip; "
-                 "Manual uses the frame below; Keyframes uses the keyframes of Cut Here.",
-                 {"Auto (scene-change detection)", "Manual frame", "Keyframes (Cut Here)"}, 0);
+                 "Manual uses the frame below; Keyframes uses the keyframes of Cut Markers.",
+                 {"Auto (scene-change detection)", "Manual frame", "Keyframes (Cut Markers)"}, 0);
     defineInt(ps, P::kCutFrame, "Cut Frame",
               "Manual mode: first frame of the new shot, in the clip's own frame numbers (see Diagnostics).",
               0, 0, 1000000);
-    defineBool(ps, P::kCutHere, "Cut Here",
-               "Keyframes mode: every keyframe of this parameter marks a cut (the first frame of the new shot); "
-               "its value does not matter. Add a keyframe at each cut you want moshed and drag keyframes to "
-               "move cuts. A keyframe on the clip's first frame is ignored. In hosts that do not report "
-               "keyframes to plugins a cut is where the value changes, so toggle it at each cut.",
-               false);    defineDouble(ps, P::kCutThreshold, "Cut Threshold",
+    {
+        // A one-entry menu: it only carries keyframes, its value never changes.
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kCutMarker, "Cut Markers",
+                                             "Keyframes mode: every keyframe of this parameter marks a cut (the "
+                                             "first frame of the new shot). Add a keyframe at each cut you want "
+                                             "moshed; drag a keyframe to move its cut, delete it to drop the cut. "
+                                             "A keyframe on the clip's first frame is ignored.");
+        gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Place keyframe on cut");
+        gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
+        gProp->propSetInt(p, kOfxParamPropAnimates, 0, 1);
+    }
+    defineDouble(ps, P::kCutThreshold, "Cut Threshold",
                  "Auto mode: how different two consecutive frames must be to count as a cut. "
                  "Diagnostics shows the largest difference seen.",
                  0.12, 0.02, 1.0);
@@ -1054,7 +1042,7 @@ static void updateEnabled(OfxImageEffectHandle inst) {
     if (!ps) return;
     const int cutMode = currentInt(ps, P::kCutMode, 0);
     setEnabled(ps, P::kCutFrame, cutMode == kCutManual);
-    setEnabled(ps, P::kCutHere, cutMode == kCutKeyframes);
+    setEnabled(ps, P::kCutMarker, cutMode == kCutKeyframes);
     setEnabled(ps, P::kCutThreshold, cutMode == 0);
     const auto mode = (mosh::Recovery)currentInt(ps, P::kRecoverMode, kDefaultRecovery);
     const bool soft = mode != mosh::Recovery::Dissolve && mode != mosh::Recovery::HardCut &&
@@ -1102,13 +1090,14 @@ static void applyStyleDefaults(OfxImageEffectHandle inst) {
 }
 // ---------------------------------------------------------------- presets
 
-// Parameters a preset stores: the look. Cut Detection depends on the clip
-// and View is a debug switch, so neither is part of a preset.
+// Parameters a preset stores. Cut Frame and the cut keyframes belong to one
+// clip and View is a debug switch, so they are left out.
 struct PresetParam {
     const char* name;
     bool isDouble;
 };
 static const PresetParam kPresetParams[] = {
+    {P::kCutMode, false},     {P::kCutThreshold, true},
     {P::kMoshStyle, false},   {P::kMoshLength, false},    {P::kResidual, true},     {P::kIntraRate, true},
     {P::kRepeat, false},      {P::kMotionScale, true},    {P::kClamp, false},       {P::kBlockSize, false},
     {P::kSearchRange, false}, {P::kSubpel, false},        {P::kIntra, true},        {P::kSmooth, false},
@@ -1247,7 +1236,7 @@ static PresetFile readPresetFile(const PathStr& path) {
 }
 
 static bool writePresetFile(const PathStr& path, const PresetFile& pf) {
-    std::string text = "# OFX Datamosh presets. Written by the plugin; one section per slot.\n";
+    std::string text = "# OFX Datamosh presets. Written by the plugin; one section per preset.\n";
     for (const auto& sec : pf) {
         text += "\n[" + sec.first + "]\n";
         for (const auto& kv : sec.second) text += kv.first + " = " + kv.second + "\n";
@@ -1279,16 +1268,120 @@ static void showMessage(OfxImageEffectHandle inst, const char* type, const std::
     gMessage->message(inst, type, nullptr, fmtText.c_str());
 }
 
-static std::string slotName(OfxParamSetHandle ps) {
-    const int slot = std::min(std::max(currentInt(ps, P::kPresetSlot, 0), 0), kPresetSlots - 1);
-    return "User " + std::to_string(slot + 1);
+// Saved Presets menu: entry 0 is a prompt, then preset names. During a host
+// session entries are only appended or relabelled, never removed or moved,
+// because a host may keep showing the menu it got when the plugin was
+// described; with append-only changes an index means the same preset in the
+// old and the updated menu. Deleted presets keep their place, marked.
+static std::mutex gPresetMutex;
+static std::vector<std::string> gPresetNames;  // index i + 1 in the menu
+static std::vector<bool> gPresetDeleted;
+static const char* kPresetPrompt = "Pick a saved preset";
+static const char* kPresetDeletedSuffix = " (deleted)";
+static const size_t kPresetNameMax = 64;
+
+static std::vector<std::string> presetMenuLocked() {
+    std::vector<std::string> m{kPresetPrompt};
+    for (size_t i = 0; i < gPresetNames.size(); ++i)
+        m.push_back(gPresetDeleted[i] ? gPresetNames[i] + kPresetDeletedSuffix : gPresetNames[i]);
+    return m;
+}
+
+// sync: bring the session list in line with the presets file (new names are
+// appended, missing ones marked deleted).
+static std::vector<std::string> presetMenu(bool sync) {
+    std::lock_guard<std::mutex> g(gPresetMutex);
+    if (sync) {
+        std::vector<bool> seen(gPresetNames.size(), false);
+        for (const auto& sec : readPresetFile(presetFile(false))) {
+            size_t i = 0;
+            while (i < gPresetNames.size() && gPresetNames[i] != sec.first) ++i;
+            if (i == gPresetNames.size()) {
+                gPresetNames.push_back(sec.first);
+                gPresetDeleted.push_back(false);
+                seen.push_back(true);
+            } else {
+                seen[i] = true;
+                gPresetDeleted[i] = false;
+            }
+        }
+        for (size_t i = 0; i < seen.size(); ++i)
+            if (!seen[i]) gPresetDeleted[i] = true;
+    }
+    return presetMenuLocked();
+}
+
+// Push the session list into this instance's menu, for hosts that update a
+// choice menu at run time. Returns how many entries the host accepted. Hosts
+// such as Natron append an entry on every write to the option property, so
+// the menu is cleared first and only touched when it differs.
+static int refreshPresetMenu(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    OfxParamHandle h = nullptr;
+    OfxPropertySetHandle props = nullptr;
+    if (!ps || gParam->paramGetHandle(ps, P::kPresetList, &h, &props) != kOfxStatOK || !props) return 0;
+    const std::vector<std::string> m = presetMenu(false);
+    int cur = 0;
+    if (gProp->propGetDimension(props, kOfxParamPropChoiceOption, &cur) == kOfxStatOK && cur == (int)m.size()) {
+        bool same = true;
+        for (int i = 0; i < cur && same; ++i) {
+            char* s = nullptr;
+            same = gProp->propGetString(props, kOfxParamPropChoiceOption, i, &s) == kOfxStatOK && s && m[(size_t)i] == s;
+        }
+        if (same) return cur;
+    }
+    gProp->propReset(props, kOfxParamPropChoiceOption);
+    int n = 0;
+    while (n < (int)m.size() && gProp->propSetString(props, kOfxParamPropChoiceOption, n, m[(size_t)n].c_str()) == kOfxStatOK)
+        ++n;
+    int dim = 0;
+    if (gProp->propGetDimension(props, kOfxParamPropChoiceOption, &dim) == kOfxStatOK) n = std::min(n, dim);
+    return n;
+}
+
+// Name of the preset picked in Saved Presets, or "" for the prompt.
+static std::string pickedPreset(OfxParamSetHandle ps) {
+    const int idx = currentInt(ps, P::kPresetList, 0);
+    std::lock_guard<std::mutex> g(gPresetMutex);
+    if (idx < 1 || idx > (int)gPresetNames.size()) return std::string();
+    return gPresetNames[(size_t)idx - 1];
+}
+
+static std::string cleanPresetName(const std::string& raw) {
+    std::string s;
+    for (char ch : raw) s += (ch == '[' || ch == ']' || ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : ch;
+    s = trim(s);
+    if (s.size() > kPresetNameMax) s = trim(s.substr(0, kPresetNameMax));
+    return s;
+}
+
+static std::string currentString(OfxParamSetHandle ps, const char* name) {
+    OfxParamHandle h = nullptr;
+    char* v = nullptr;
+    if (gParam->paramGetHandle(ps, name, &h, nullptr) != kOfxStatOK || !h) return std::string();
+    if (gParam->paramGetValue(h, &v) != kOfxStatOK || !v) return std::string();
+    return v;
+}
+
+static void setString(OfxParamSetHandle ps, const char* name, const std::string& v) {
+    OfxParamHandle h = nullptr;
+    if (gParam->paramGetHandle(ps, name, &h, nullptr) == kOfxStatOK && h) gParam->paramSetValue(h, v.c_str());
 }
 
 static void savePreset(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
-    const std::string slot = slotName(ps);
+    const std::string name = cleanPresetName(currentString(ps, P::kPresetName));
+    if (name.empty()) {
+        showMessage(inst, kOfxMessageMessage, "Datamosh: type a name in Preset Name first.");
+        return;
+    }
+    if (name == kPresetPrompt) {
+        showMessage(inst, kOfxMessageMessage, "Datamosh: pick another name for the preset.");
+        return;
+    }
     PresetValues vals;
     for (const PresetParam& pp : kPresetParams) {
         OfxParamHandle h = nullptr;
@@ -1315,35 +1408,55 @@ static void savePreset(OfxImageEffectHandle inst) {
         showMessage(inst, kOfxMessageError, "Datamosh: no user settings folder found, preset not saved.");
         return;
     }
-    PresetFile pf = readPresetFile(path);
-    bool replaced = false;
-    for (auto& sec : pf)
-        if (sec.first == slot) {
-            sec.second = vals;
-            replaced = true;
+    int menuIndex = 0;
+    {
+        std::lock_guard<std::mutex> g(gPresetMutex);
+        PresetFile pf = readPresetFile(path);
+        bool replaced = false;
+        for (auto& sec : pf)
+            if (sec.first == name) {
+                sec.second = vals;
+                replaced = true;
+            }
+        if (!replaced) pf.push_back({name, vals});
+        if (!writePresetFile(path, pf)) {
+            showMessage(inst, kOfxMessageError, "Datamosh: could not write " + pathToUtf8(path) + ".");
+            return;
         }
-    if (!replaced) pf.push_back({slot, vals});
-    std::sort(pf.begin(), pf.end(),
-              [](const std::pair<std::string, PresetValues>& a, const std::pair<std::string, PresetValues>& b) {
-                  return a.first < b.first;
-              });
-    if (!writePresetFile(path, pf))
-        showMessage(inst, kOfxMessageError, "Datamosh: could not write " + pathToUtf8(path) + ".");
-    else
-        showMessage(inst, kOfxMessageMessage, "Datamosh: settings saved to " + slot + ".");
+        size_t i = 0;
+        while (i < gPresetNames.size() && gPresetNames[i] != name) ++i;
+        if (i == gPresetNames.size()) {
+            gPresetNames.push_back(name);
+            gPresetDeleted.push_back(false);
+        }
+        gPresetDeleted[i] = false;
+        menuIndex = (int)i + 1;
+    }
+    const bool listed = menuIndex < refreshPresetMenu(inst);
+    OfxParamHandle h = nullptr;
+    if (listed && gParam->paramGetHandle(ps, P::kPresetList, &h, nullptr) == kOfxStatOK && h)
+        gParam->paramSetValue(h, menuIndex);
+    setString(ps, P::kPresetName, name);
+    showMessage(inst, kOfxMessageMessage,
+                "Datamosh: preset \"" + name + "\" saved." +
+                    (listed ? "" : " It appears in Saved Presets after the host restarts."));
 }
 
 static void loadPreset(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
-    const std::string slot = slotName(ps);
+    const std::string name = pickedPreset(ps);
+    if (name.empty()) {
+        showMessage(inst, kOfxMessageMessage, "Datamosh: pick a preset in Saved Presets first.");
+        return;
+    }
     const PresetFile pf = readPresetFile(presetFile(false));
     const PresetValues* vals = nullptr;
     for (const auto& sec : pf)
-        if (sec.first == slot) vals = &sec.second;
+        if (sec.first == name) vals = &sec.second;
     if (!vals) {
-        showMessage(inst, kOfxMessageMessage, "Datamosh: " + slot + " is empty. Save settings to it first.");
+        showMessage(inst, kOfxMessageMessage, "Datamosh: preset \"" + name + "\" is not in the presets file any more.");
         return;
     }
     gParam->paramEditBegin(ps, "Load Preset");
@@ -1361,11 +1474,52 @@ static void loadPreset(OfxImageEffectHandle inst) {
     gParam->paramEditEnd(ps);
     updateEnabled(inst);
 }
+
+static void deletePreset(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    if (!ps) return;
+    const std::string name = pickedPreset(ps);
+    if (name.empty()) {
+        showMessage(inst, kOfxMessageMessage, "Datamosh: pick a preset in Saved Presets first.");
+        return;
+    }
+    const PathStr path = presetFile(false);
+    {
+        std::lock_guard<std::mutex> g(gPresetMutex);
+        PresetFile pf = readPresetFile(path);
+        const size_t before = pf.size();
+        pf.erase(std::remove_if(pf.begin(), pf.end(),
+                                [&](const std::pair<std::string, PresetValues>& s) { return s.first == name; }),
+                 pf.end());
+        if (pf.size() != before && !writePresetFile(path, pf)) {
+            showMessage(inst, kOfxMessageError, "Datamosh: could not write " + pathToUtf8(path) + ".");
+            return;
+        }
+        for (size_t i = 0; i < gPresetNames.size(); ++i)
+            if (gPresetNames[i] == name) gPresetDeleted[i] = true;
+    }
+    refreshPresetMenu(inst);
+    OfxParamHandle h = nullptr;
+    if (gParam->paramGetHandle(ps, P::kPresetList, &h, nullptr) == kOfxStatOK && h) gParam->paramSetValue(h, 0);
+    showMessage(inst, kOfxMessageMessage, "Datamosh: preset \"" + name + "\" deleted.");
+}
+
+// Picking a preset fills in its name, so Save Preset updates it.
+static void presetPicked(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    if (!ps) return;
+    const std::string name = pickedPreset(ps);
+    if (!name.empty()) setString(ps, P::kPresetName, name);
+}
 static OfxStatus createInstance(OfxImageEffectHandle inst) {
     OfxPropertySetHandle props = nullptr;
     gEffect->getPropertySet(inst, &props);
     if (props) gProp->propSetPointer(props, kOfxPropInstanceData, 0, new Instance());
     updateEnabled(inst);
+    presetMenu(true);
+    refreshPresetMenu(inst);
     return kOfxStatOK;
 }
 
@@ -1684,8 +1838,9 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
                 gProp->propGetString(inArgs, kOfxPropName, 0, &name);
                 gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
             }
-            const bool noRender = name && (!strcmp(name, P::kPresetSlot) || !strcmp(name, P::kPresetSave) ||
-                                           !strcmp(name, P::kPresetLoad) || !strncmp(name, "help", 4));
+            const bool noRender = name && (!strcmp(name, P::kPresetName) || !strcmp(name, P::kPresetSave) ||
+                                           !strcmp(name, P::kPresetList) || !strcmp(name, P::kPresetLoad) ||
+                                           !strcmp(name, P::kPresetDelete));
             if (!noRender)
                 if (Instance* d = instanceData(effect)) d->clear();
             if (!strcmp(action, kOfxActionInstanceChanged)) {
@@ -1693,6 +1848,9 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
                     applyStyleDefaults(effect);
                 if (name && !strcmp(name, P::kPresetSave)) savePreset(effect);
                 if (name && !strcmp(name, P::kPresetLoad)) loadPreset(effect);
+                if (name && !strcmp(name, P::kPresetDelete)) deletePreset(effect);
+                if (name && reason && !strcmp(name, P::kPresetList) && !strcmp(reason, kOfxChangeUserEdited))
+                    presetPicked(effect);
                 updateEnabled(effect);
             }
             return kOfxStatOK;

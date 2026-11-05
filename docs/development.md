@@ -115,14 +115,15 @@ output's bounds, `MOCK_OFFSET=n` moves every image's origin to (n, n),
 `MOCK_NO_TEMPORAL=1` reports a host without temporal clip access. The host
 prints the total and average time spent in render.
 
-`MOCK_KEYS=cutHere=1010,1030` gives a parameter keyframes at those times
-(the fake clip starts at frame 1000, the cut in it is at 1020); every key
-flips an integer or boolean value, as toggling a checkbox would.
-`MOCK_NO_KEYAPI=1` makes the host refuse keyframe queries, for the
-value-change fallback of the Keyframes cut mode. `MOCK_PRESETS=1` saves
-settings to a preset slot, changes them, loads them back, loads an empty
-slot, prints the values after each step and exits; point
-`OFX_DATAMOSH_PRESETS` at a scratch file so your own presets stay untouched.
+`MOCK_KEYS=cutMarker=1010,1030` gives a parameter keyframes at those times
+(the fake clip starts at frame 1000, the cut in it is at 1020).
+`MOCK_NO_KEYAPI=1` makes the host refuse keyframe queries (Keyframes mode
+then finds no cut). `MOCK_PRESETS=1` runs the preset buttons: saves named
+presets, picks, loads and deletes them, prints the values and the Saved
+Presets menu after each step and exits; point `OFX_DATAMOSH_PRESETS` at a
+scratch file so your own presets stay untouched. `MOCK_FIXED_CHOICES=1`
+emulates a host that keeps the menus it got when the plugin was described
+(new presets then appear only after a restart).
 Messages the plugin shows through the message suite are printed as
 `[message ...]`.
 
