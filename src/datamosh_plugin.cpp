@@ -67,7 +67,8 @@ static OfxMessageSuiteV1* gMessage = nullptr;  // optional
 namespace P {
 const char* kCutMode = "cutMode";           // choice: auto / manual / keyframes
 const char* kCutFrame = "cutFrame";         // int
-const char* kCutMarker = "cutMarker";       // one-entry choice, keyframes mark cuts
+const char* kCutKeys = "cutKeys";           // double, its keyframes mark cuts; the value is unused
+const char* kCutMarker = "cutMarker";       // hidden one-entry choice: Cut Markers of earlier development builds
 const char* kCutThreshold = "cutThreshold"; // double
 const char* kMoshLength = "moshLength";     // int frames
 const char* kBlockSize = "blockSize";       // choice: 8/16/32/64
@@ -1027,15 +1028,22 @@ static void finishPlan(Plan& pl) {
 
 // Keyframes mode: the most recent keyframe of Cut Markers at or before t is
 // the first frame of the new shot. A keyframe on the clip's first frame has
-// no old picture before it and is skipped.
+// no old picture before it and is skipped. Keyframes of the old Cut Markers
+// menu count too.
 static void keyframeCut(OfxParamSetHandle ps, Plan& pl) {
-    OfxParamHandle h = nullptr;
-    if (!ps || gParam->paramGetHandle(ps, P::kCutMarker, &h, nullptr) != kOfxStatOK || !h) return;
+    if (!ps) return;
     const double first = pl.clipFirst;
     const double eps = 1e-6;
-    unsigned int n = 0;
-    if (gParam->paramGetNumKeys && gParam->paramGetKeyTime && gParam->paramGetNumKeys(h, &n) == kOfxStatOK) {
-        pl.cutKeys = (int)n;
+    bool reported = false;
+    pl.cutKeys = 0;
+    for (const char* name : {P::kCutKeys, P::kCutMarker}) {
+        OfxParamHandle h = nullptr;
+        if (gParam->paramGetHandle(ps, name, &h, nullptr) != kOfxStatOK || !h) continue;
+        unsigned int n = 0;
+        if (!gParam->paramGetNumKeys || !gParam->paramGetKeyTime || gParam->paramGetNumKeys(h, &n) != kOfxStatOK)
+            continue;
+        reported = true;
+        pl.cutKeys += (int)n;
         for (unsigned int i = 0; i < n; ++i) {
             OfxTime kt = 0;
             if (gParam->paramGetKeyTime(h, i, &kt) != kOfxStatOK) continue;
@@ -1046,11 +1054,38 @@ static void keyframeCut(OfxParamSetHandle ps, Plan& pl) {
                 pl.cutFrame = kt;
             }
         }
-        return;
     }
-    pl.cutKeys = -1;
+    if (!reported) pl.cutKeys = -1;
 }
-static Plan makePlan(OfxImageEffectHandle inst, double t) {
+
+// Moves keyframes of the old Cut Markers menu to Cut Markers, so they show
+// and can be edited. The old ones go only once every one is copied.
+static void migrateCutKeys(OfxImageEffectHandle inst) {
+    static thread_local bool busy = false;  // setting keys sends instance-changed again
+    if (busy || !gParam->paramGetNumKeys || !gParam->paramGetKeyTime || !gParam->paramSetValueAtTime ||
+        !gParam->paramDeleteAllKeys)
+        return;
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    OfxParamHandle from = nullptr, to = nullptr;
+    if (!ps || gParam->paramGetHandle(ps, P::kCutMarker, &from, nullptr) != kOfxStatOK || !from ||
+        gParam->paramGetHandle(ps, P::kCutKeys, &to, nullptr) != kOfxStatOK || !to)
+        return;
+    unsigned int n = 0;
+    if (gParam->paramGetNumKeys(from, &n) != kOfxStatOK || n == 0) return;
+    std::vector<OfxTime> times;
+    for (unsigned int i = 0; i < n; ++i) {
+        OfxTime kt = 0;
+        if (gParam->paramGetKeyTime(from, i, &kt) == kOfxStatOK) times.push_back(kt);
+    }
+    busy = true;
+    gParam->paramEditBegin(ps, "Cut Markers");
+    bool ok = times.size() == n;
+    for (OfxTime kt : times) ok = gParam->paramSetValueAtTime(to, kt, 0.0) == kOfxStatOK && ok;
+    if (ok) gParam->paramDeleteAllKeys(from);
+    gParam->paramEditEnd(ps);
+    busy = false;
+}static Plan makePlan(OfxImageEffectHandle inst, double t) {
     Plan pl;
     pl.t = t;
     OfxParamSetHandle ps = nullptr;
@@ -1225,18 +1260,33 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
               "frame numbers (see Diagnostics).",
               0, 0, 1000000);
     {
-        // A one-entry menu: it only carries keyframes, its value never changes.
-        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kCutMarker, "Cut Markers",
+        // Only the keyframes matter. A number rather than a one-entry menu:
+        // hosts show keyframes of numeric parameters in their keyframe views.
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeDouble, P::kCutKeys, "Cut Markers",
                                              "Keyframes mode: every keyframe of this parameter marks a cut (the "
                                              "first frame of the new shot; Repeat: where a repeat starts). Add a "
-                                             "keyframe at each cut you want "
-                                             "moshed; drag a keyframe to move its cut, delete it to drop the cut. "
-                                             "A keyframe on the clip's first frame is ignored.");
+                                             "keyframe at each cut you want moshed; drag a keyframe to move its cut, "
+                                             "delete it to drop the cut. The value does nothing, only where the "
+                                             "keyframes are. A keyframe on the clip's first frame is ignored.");
+        gProp->propSetDouble(p, kOfxParamPropDefault, 0, 0.0);
+        gProp->propSetDouble(p, kOfxParamPropMin, 0, 0.0);
+        gProp->propSetDouble(p, kOfxParamPropMax, 0, 1.0);
+        gProp->propSetDouble(p, kOfxParamPropDisplayMin, 0, 0.0);
+        gProp->propSetDouble(p, kOfxParamPropDisplayMax, 0, 1.0);
+        gProp->propSetString(p, kOfxParamPropDoubleType, 0, kOfxParamDoubleTypePlain);
+        gProp->propSetInt(p, kOfxParamPropAnimates, 0, 1);
+    }
+    {
+        // Cut Markers of earlier development builds: a one-entry menu, whose
+        // keyframes hosts do not show. Hidden, kept so that the keyframes of
+        // projects made with them still count until they are moved over.
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kCutMarker, "Cut Markers (old)",
+                                             "Replaced by Cut Markers.");
         gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Place keyframe on cut");
         gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
         gProp->propSetInt(p, kOfxParamPropAnimates, 0, 1);
-    }
-    defineDouble(ps, P::kCutThreshold, "Cut Threshold",
+        gProp->propSetInt(p, kOfxParamPropSecret, 0, 1);
+    }    defineDouble(ps, P::kCutThreshold, "Cut Threshold",
                  "Auto mode: how different two consecutive frames must be to count as a cut. "
                  "Diagnostics shows the largest difference seen.",
                  0.12, 0.02, 1.0);
@@ -1398,7 +1448,7 @@ static void updateEnabled(OfxImageEffectHandle inst) {
     if (!ps) return;
     const int cutMode = currentInt(ps, P::kCutMode, 0);
     setEnabled(ps, P::kCutFrame, cutMode == kCutManual);
-    setEnabled(ps, P::kCutMarker, cutMode == kCutKeyframes);
+    setEnabled(ps, P::kCutKeys, cutMode == kCutKeyframes);
     setEnabled(ps, P::kCutThreshold, cutMode == 0);
     const auto mode = (mosh::Recovery)currentInt(ps, P::kRecoverMode, kDefaultRecovery);
     const bool soft = mode != mosh::Recovery::Dissolve && mode != mosh::Recovery::HardCut &&
@@ -2527,6 +2577,7 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
             if (!noRender)
                 if (Instance* d = instanceData(effect)) d->clear();
             if (!strcmp(action, kOfxActionInstanceChanged)) {
+                migrateCutKeys(effect);
                 if (name && reason && !strcmp(name, P::kMoshStyle) && !strcmp(reason, kOfxChangeUserEdited))
                     applyStyleDefaults(effect);
                 if (name && !strcmp(name, P::kPresetSave)) savePreset(effect);

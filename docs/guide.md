@@ -58,7 +58,7 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 |---|---|---|
 | Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Markers, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). |
 | Cut Frame | 0 | Manual mode: first frame of the new shot (Repeat: the first repeated frame), in the clip's own frame numbers (Diagnostics shows `T`). |
-| Cut Markers | Place keyframe on cut | Keyframes mode: every keyframe of this parameter is a cut (Repeat: the start of a repeat). The menu has one entry; only the keyframes matter. |
+| Cut Markers | 0 | Keyframes mode: every keyframe of this parameter is a cut (Repeat: the start of a repeat). The value does nothing; only where the keyframes are matters. |
 | Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 
 **Mosh**
@@ -189,8 +189,9 @@ to **Keyframes (Cut Markers)** and mark the cuts with keyframes of **Cut
 Markers**:
 
 1. Move the playhead to the first frame of the new shot.
-2. Click the keyframe button next to Cut Markers. Its menu has a single
-   entry, "Place keyframe on cut"; only where the keyframes are matters.
+2. Click the keyframe button next to Cut Markers. Its value does nothing,
+   only where the keyframes are matters. It is a number so that the host
+   can show its keyframes in its keyframe views.
 3. Repeat for every cut you want moshed.
 
 To move a cut, drag its keyframe; to drop a cut, delete its keyframe. Only
@@ -198,6 +199,11 @@ marked cuts are moshed, any others in the clip are left alone. A keyframe
 on the very first frame of the clip is ignored, because there is no old
 picture before it. Diagnostics shows `KEYS n`, the number of keyframes the
 plugin sees.
+
+Development builds before this one used a one-entry menu for Cut Markers,
+whose keyframes Resolve does not show. Projects made with them keep their
+cuts; the first time any setting of the effect is changed, those keyframes
+move to the new Cut Markers.
 
 Some hosts do not tell plugins where keyframes are. There Diagnostics shows
 `KEYS UNKNOWN` and Keyframes mode finds no cut; use Auto or Manual frame

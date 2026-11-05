@@ -5,6 +5,7 @@
 // Images are handed to the plugin bottom-up, like real OFX hosts do.
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -171,6 +172,21 @@ static OfxStatus paramGetValue(OfxParamHandle ph, ...) {
     return kOfxStatOK;
 }
 static OfxStatus unsupported(...) { return kOfxStatErrUnsupported; }
+// Adds (or moves the value of) a keyframe; keyframed values are not modelled.
+static OfxStatus paramSetValueAtTime(OfxParamHandle ph, OfxTime t, ...) {
+    Param* p = reinterpret_cast<Param*>(ph);
+    if (gNoKeyApi) return kOfxStatErrUnsupported;
+    if (std::find(p->keys.begin(), p->keys.end(), t) == p->keys.end()) {
+        p->keys.push_back(t);
+        std::sort(p->keys.begin(), p->keys.end());
+    }
+    return kOfxStatOK;
+}
+static OfxStatus paramDeleteAllKeys(OfxParamHandle ph) {
+    if (gNoKeyApi) return kOfxStatErrUnsupported;
+    reinterpret_cast<Param*>(ph)->keys.clear();
+    return kOfxStatOK;
+}
 static OfxStatus paramSetValue(OfxParamHandle ph, ...) {
     Param* p = reinterpret_cast<Param*>(ph);
     va_list ap; va_start(ap, ph);
@@ -187,12 +203,12 @@ static OfxParameterSuiteV1 gParamSuite = {
     (OfxStatus(*)(OfxParamHandle, OfxTime, ...))unsupported,            // derivative
     (OfxStatus(*)(OfxParamHandle, OfxTime, OfxTime, ...))unsupported,   // integral
     paramSetValue,                                                      // setValue
-    (OfxStatus(*)(OfxParamHandle, OfxTime, ...))unsupported,            // setValueAtTime
+    paramSetValueAtTime,
     paramGetNumKeys,
     paramGetKeyTime,
     (OfxStatus(*)(OfxParamHandle, OfxTime, int, int*))unsupported,
     (OfxStatus(*)(OfxParamHandle, OfxTime))unsupported,
-    (OfxStatus(*)(OfxParamHandle))unsupported,
+    paramDeleteAllKeys,
     (OfxStatus(*)(OfxParamHandle, OfxParamHandle, OfxTime, const OfxRangeD*))unsupported,
     (OfxStatus(*)(OfxParamSetHandle, const char*))unsupported,
     (OfxStatus(*)(OfxParamSetHandle))unsupported,
@@ -492,6 +508,19 @@ int main(int argc, char** argv) {
         c->props.s[kOfxImageEffectPropPixelDepth] = {kOfxBitDepthFloat};
     }
     CHECK(pl->mainEntry(kOfxActionCreateInstance, &inst, nullptr, nullptr), "createInstance");
+    if (const char* e = getenv("MOCK_CHANGE")) {  // the user edits parameter e; then list every keyframed parameter
+        PropSet ic;
+        ic.s[kOfxPropName] = {e};
+        ic.s[kOfxPropChangeReason] = {kOfxChangeUserEdited};
+        ic.d[kOfxPropTime] = {gT0};
+        CHECK(pl->mainEntry(kOfxActionInstanceChanged, &inst, H(&ic), nullptr), "instanceChanged");
+        for (auto& kv : inst.params.params) {
+            if (kv.second->keys.empty()) continue;
+            printf("keys %s:", kv.first.c_str());
+            for (double k : kv.second->keys) printf(" %.0f", k);
+            printf("\n");
+        }
+    }
     if (getenv("MOCK_PRESETS")) {  // save, pick, load, delete named presets (OFX_DATAMOSH_PRESETS: file)
         auto& P = inst.params.params;
         auto press = [&](const char* name) {
