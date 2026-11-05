@@ -128,6 +128,18 @@ host that cannot clear a menu but lets entries be rewritten and added.
 Messages the plugin shows through the message suite are printed as
 `[message ...]`.
 
+`MOCK_CONCURRENT=n` renders n frames at a time in frame order, finishing in
+any order, the way hosts render during playback; `MOCK_TIMES=1` prints the
+render time and the number of source frames fetched for every frame, and
+`MOCK_FETCH_MS=n` makes each source fetch take n ms, like a host that
+decodes or renders the input on demand.
+
+Setting `OFX_DATAMOSH_LOG` to a file path before starting a host makes the
+plugin append one line per render: the thread, the time spent and the time
+waited for an earlier frame, the frame the chain continued from (`cut` for
+a full rebuild), the steps run, the source frames fetched and the device.
+That shows how a host schedules renders.
+
 `build/mosh_test` runs only the algorithm core on two raw clips.
 `MOCK_FLOAT=1` makes `mock_host` write the raw float RGBA output instead of
 rgb24, for exact comparisons between builds or devices (add

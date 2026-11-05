@@ -47,6 +47,9 @@ public:
     // the device cache (store moves it there), or downloaded.
     bool setAcc(const mosh::Image& img);
     bool restoreAcc(const void* owner, double t, double cut, uint64_t hash, std::vector<uint8_t>& refreshed);
+    // Time of the newest cached picture of the chain a whole number of
+    // frames before t and not before the cut, or -HUGE_VAL.
+    double latestAcc(const void* owner, double t, double cut, uint64_t hash) const;
     bool storeAcc(const void* owner, double t, double cut, uint64_t hash, const std::vector<uint8_t>& refreshed);
     bool downloadAcc(mosh::Image& out);
 

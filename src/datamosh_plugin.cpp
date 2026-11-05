@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,9 +15,12 @@
 #include <ctime>
 #include <deque>
 #include <clocale>
+#include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -561,15 +566,96 @@ struct Instance {
     static constexpr size_t kAccEntries = 2;
     static constexpr size_t kMaxDiffs = 100000;
 
+    // Unstrided chain renders in progress. Hosts render several frames at
+    // once during playback; a render whose nearest usable picture is an
+    // earlier frame still being rendered waits for that frame instead of
+    // rebuilding the chain from the cut, which costs a step and a host fetch
+    // per frame since the cut.
+    struct Busy {
+        double t, cut;
+        uint64_t hash;
+        std::chrono::steady_clock::time_point beat;  // start or last finished step
+    };
+    using BusyIt = std::list<Busy>::iterator;
+    std::list<Busy> busy;
+    std::condition_variable busyDone;
+    // Frames whose picture went into the CPU or the GPU cache, newest last.
+    struct Stored {
+        double t, cut;
+        uint64_t hash;
+    };
+    std::deque<Stored> stored;
+    static constexpr size_t kStoredEntries = 8;
+    // A render that has not finished a step for this long may be waiting on
+    // the host itself; its followers stop waiting for it.
+    static constexpr std::chrono::seconds kStall{10};
+
     ~Instance() { mosh_gpu::forget(this); }
+
+    // a is a whole number of frames (at least one) before t.
+    static bool before(double a, double t) {
+        const double d = t - a;
+        return d > 0.5 && std::fabs(d - std::round(d)) < 1e-6;
+    }
+    double latestStoredLocked(double t, double cut, uint64_t hash) const {
+        double best = -HUGE_VAL;
+        for (const Stored& s : stored)
+            if (s.cut == cut && s.hash == hash && s.t >= cut && before(s.t, t) && s.t > best) best = s.t;
+        return best;
+    }
+    void noteStoredLocked(double t, double cut, uint64_t hash) {
+        for (auto it = stored.begin(); it != stored.end(); ++it)
+            if (it->t == t && it->cut == cut && it->hash == hash) {
+                stored.erase(it);
+                break;
+            }
+        stored.push_back({t, cut, hash});
+        while (stored.size() > kStoredEntries) stored.pop_front();
+    }
+    void noteStored(double t, double cut, uint64_t hash) {
+        std::lock_guard<std::mutex> g(m);
+        noteStoredLocked(t, cut, hash);
+    }
+    // Registers a render of frame t of a chain. Waits first while an earlier
+    // frame of the chain, newer than every stored picture, is being rendered.
+    BusyIt enter(double t, double cut, uint64_t hash, double& waitedMs) {
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) {
+            const double have = latestStoredLocked(t, cut, hash);
+            const Busy* ahead = nullptr;
+            for (const Busy& b : busy)
+                if (b.cut == cut && b.hash == hash && b.t > have && before(b.t, t) && (!ahead || b.t > ahead->t))
+                    ahead = &b;
+            if (!ahead || clock::now() - ahead->beat > kStall) break;
+            busyDone.wait_for(lk, std::chrono::milliseconds(100));
+        }
+        waitedMs = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+        busy.push_back({t, cut, hash, clock::now()});
+        return std::prev(busy.end());
+    }
+    void beat(BusyIt it) {
+        std::lock_guard<std::mutex> g(m);
+        it->beat = std::chrono::steady_clock::now();
+    }
+    void leave(BusyIt it) {
+        {
+            std::lock_guard<std::mutex> g(m);
+            busy.erase(it);
+        }
+        busyDone.notify_all();
+    }
 
     void clear() {
         {
             std::lock_guard<std::mutex> g(m);
             pairDiff.clear();
             accCache.clear();
+            stored.clear();
             frame.reset();
         }
+        busyDone.notify_all();
         // Outside m: a GPU render holds the GPU while it takes m.
         mosh_gpu::forget(this);
     }
@@ -596,6 +682,15 @@ struct Instance {
         if (pairDiff.size() > kMaxDiffs) pairDiff.clear();
         pairDiff[f] = d;
     }
+    // Time of the newest cached picture of the chain a whole number of
+    // frames before t, or -HUGE_VAL.
+    double latestAcc(double t, double cut, uint64_t hash) {
+        std::lock_guard<std::mutex> g(m);
+        double best = -HUGE_VAL;
+        for (const AccEntry& e : accCache)
+            if (e.cutFrame == cut && e.hash == hash && e.t >= cut && before(e.t, t) && e.t > best) best = e.t;
+        return best;
+    }
     bool getAcc(double t, double cut, uint64_t hash, mosh::Image& out, std::vector<uint8_t>& refreshed) {
         std::lock_guard<std::mutex> g(m);
         for (const AccEntry& e : accCache)
@@ -612,10 +707,30 @@ struct Instance {
             if (e.t == t && e.cutFrame == cut && e.hash == hash) {
                 e.acc = std::move(acc);
                 e.refreshed = refreshed;
+                noteStoredLocked(t, cut, hash);
                 return;
             }
         accCache.push_back({t, cut, hash, std::move(acc), refreshed});
         while (accCache.size() > kAccEntries) accCache.pop_front();
+        noteStoredLocked(t, cut, hash);
+    }
+};
+
+// Marks one render of a chain as in progress for as long as it lives.
+struct ChainTicket {
+    Instance* in = nullptr;
+    Instance::BusyIt it;
+    ChainTicket() = default;
+    ChainTicket(const ChainTicket&) = delete;
+    ChainTicket& operator=(const ChainTicket&) = delete;
+    ~ChainTicket() { done(); }
+    // Ends the render's turn once its picture is stored.
+    void done() {
+        if (in) in->leave(it);
+        in = nullptr;
+    }
+    void beat() const {
+        if (in) in->beat(it);
     }
 };
 
@@ -1623,6 +1738,7 @@ struct ChainResult {
     float firstPairDiff = -1.f;
     int stepsDone = 0;
     bool fromCache = false;
+    double startT = -HUGE_VAL;       // frame of the cached picture the chain continued from
     bool aborted = false;
     std::vector<uint8_t> refreshed;  // Motion refresh state, carried along the chain
     std::string device;              // where it was computed, for Diagnostics
@@ -1639,13 +1755,27 @@ struct FrameSource {
     FramePtr cur;
     double tPrev = 0;
     FramePtr prev;
+    const ChainTicket* ticket = nullptr;  // told about every finished step
+    mutable int fetched = 0;              // frames fetched from the host by get()
 
     FramePtr get(double t) const {
         if (cur && t == tCur) return cur;
         if (prev && t == tPrev) return prev;
+        ++fetched;
         return fetchFrame(clip, t, rect, pf);
     }
 };
+
+// Unit steps from frame a to frame t, a whole number of frames before it:
+// the tail of the unstrided chain from the cut.
+static std::vector<double> stepsFrom(double a, double t) {
+    const long n = std::lround(t - a);
+    std::vector<double> ts;
+    ts.reserve((size_t)n + 1);
+    for (long i = 0; i < n; ++i) ts.push_back(a + (double)i);
+    ts.push_back(t);
+    return ts;
+}
 
 // Runs motion steps over frames `times` on top of acc, or on top of the
 // GPU's accumulated picture when gpu is set. Returns false on a GPU error.
@@ -1727,6 +1857,7 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
         }
         prev = std::move(cur);
         ++cr.stepsDone;
+        if (fs.ticket) fs.ticket->beat();
     }
     return true;
 }
@@ -1739,12 +1870,18 @@ static bool renderOnGpu(OfxImageEffectHandle inst, mosh_gpu::Session& gpu, Insta
     const double t = pl.t;
     mosh::Image unused;
     bool ok;
-    if (unstrided && pl.nFrames >= 1 && cache && gpu.restoreAcc(cache, t - 1.0, pl.cutFrame, hash, cr.refreshed)) {
+    // Continue from the newest cached picture of the chain, on the GPU or the CPU.
+    const bool reuse = unstrided && pl.nFrames >= 1 && cache;
+    const double onGpu = reuse ? gpu.latestAcc(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
+    const double onCpu = reuse ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
+    if (onGpu > -HUGE_VAL && onGpu >= onCpu && gpu.restoreAcc(cache, onGpu, pl.cutFrame, hash, cr.refreshed)) {
         cr.fromCache = true;
-        ok = runSteps(inst, fs, pl, {t - 1.0, t}, unused, cr, pf, &gpu);
-    } else if (unstrided && pl.nFrames >= 1 && cache && cache->getAcc(t - 1.0, pl.cutFrame, hash, unused, cr.refreshed)) {
+        cr.startT = onGpu;
+        ok = runSteps(inst, fs, pl, stepsFrom(onGpu, t), unused, cr, pf, &gpu);
+    } else if (onCpu > -HUGE_VAL && cache->getAcc(onCpu, pl.cutFrame, hash, unused, cr.refreshed)) {
         cr.fromCache = true;
-        ok = gpu.setAcc(unused) && runSteps(inst, fs, pl, {t - 1.0, t}, unused, cr, pf, &gpu);
+        cr.startT = onCpu;
+        ok = gpu.setAcc(unused) && runSteps(inst, fs, pl, stepsFrom(onCpu, t), unused, cr, pf, &gpu);
     } else {
         cr.refreshed.clear();
         FramePtr ref = fs.get(pl.cutFrame - 1.0);
@@ -1757,7 +1894,7 @@ static bool renderOnGpu(OfxImageEffectHandle inst, mosh_gpu::Session& gpu, Insta
     } else {
         if (!gpu.downloadAcc(result)) return false;
     }
-    if (store) gpu.storeAcc(cache, t, pl.cutFrame, hash, cr.refreshed);
+    if (store && gpu.storeAcc(cache, t, pl.cutFrame, hash, cr.refreshed)) cache->noteStored(t, pl.cutFrame, hash);
     return !gpu.failed();
 }
 
@@ -1809,7 +1946,31 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
     line("DEV " + fontSafe(cr.device, 72));
 }
 
+// OFX_DATAMOSH_LOG=<file>: one line per render (thread, time spent, time
+// waited for an earlier frame, where the chain started, steps, frames
+// fetched from the host, device), to see how a host schedules renders.
+static void logRender(double t, double ms, double waitedMs, const Plan& pl, const ChainResult& cr, int fetched) {
+    static const char* path = getenv("OFX_DATAMOSH_LOG");
+    if (!path || !*path) return;
+    static std::mutex mu;
+    static FILE* fp = nullptr;
+    static const auto start = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> g(mu);
+    if (!fp) fp = fopen(path, "a");
+    if (!fp) return;
+    const double at = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    char from[32];
+    if (pl.passThrough) snprintf(from, sizeof from, "-");
+    else if (cr.fromCache) snprintf(from, sizeof from, "%.0f", cr.startT);
+    else snprintf(from, sizeof from, "cut");
+    fprintf(fp, "%10.1f thr %08x t %.1f %8.1f ms wait %7.1f n %d from %s steps %d fetched %d scanned %d %s\n", at,
+            (unsigned)std::hash<std::thread::id>()(std::this_thread::get_id()), t, ms, waitedMs, pl.nFrames, from,
+            cr.stepsDone, fetched, pl.scanned, cr.device.c_str());
+    fflush(fp);
+}
+
 static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) {
+    const auto t0 = std::chrono::steady_clock::now();
     double t = 0;
     gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
     OfxRectI rw{};
@@ -1853,14 +2014,26 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     if (!pl.cutKnown && pl.s.cutMode == 0) detectCut(src, cache, pl, R, fs.cur, fs.prev);
 
     const Settings& s = pl.s;
+    ChainResult cr;
+    double waitedMs = 0;
+    auto finish = [&]() {
+        logRender(t, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), waitedMs,
+                  pl, cr, fs.fetched + 1);
+        return kOfxStatOK;
+    };
 
     if (s.view == 0 && pl.passThrough) {
         out.fromImage(*fs.cur, R, rw, pf);
-        return kOfxStatOK;
+        return finish();
     }
 
-    ChainResult cr;
     const bool unstrided = pl.steps == pl.nFrames;
+    ChainTicket ticket;
+    if (cache && unstrided && !pl.passThrough) {
+        ticket.in = cache;
+        ticket.it = cache->enter(t, pl.cutFrame, chainHash(s, R), waitedMs);
+        fs.ticket = &ticket;
+    }
     const auto mode = (mosh::Recovery)s.recoverMode;
     // These modes recover inside the chain; compose only matters at the very end.
     const bool inChain = mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural;
@@ -1881,9 +2054,10 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         if (gpu && renderOnGpu(inst, *gpu, cache, fs, pl, unstrided, composeNeeded, cp, result, cr, pf)) {
             cr.device = gpu->label();
             gpu.reset();
+            ticket.done();
             if (s.view == 2) drawDiagnostics(result, pl, cr, out.width(), out.height());
             out.fromImage(result, R, rw, pf);
-            return kOfxStatOK;
+            return finish();
         }
         cr = ChainResult();
         cr.device = "CPU: " + (gpu ? gpu->error() : why);
@@ -1893,11 +2067,13 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     uint64_t hash = 0;
     if (!pl.passThrough) {
         hash = chainHash(s, R);
-        // Fast path: the previous frame's accumulated picture is cached and the
-        // chain is unstrided, so one more step gives exactly the same result.
-        if (unstrided && pl.nFrames >= 1 && cache && cache->getAcc(t - 1.0, pl.cutFrame, hash, acc, cr.refreshed)) {
+        // Fast path: an earlier frame's accumulated picture is cached and the
+        // chain is unstrided, so the steps from there give exactly the same result.
+        const double from = unstrided && pl.nFrames >= 1 && cache ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
+        if (from > -HUGE_VAL && cache->getAcc(from, pl.cutFrame, hash, acc, cr.refreshed)) {
             cr.fromCache = true;
-            runSteps(inst, fs, pl, {t - 1.0, t}, acc, cr, pf);
+            cr.startT = from;
+            runSteps(inst, fs, pl, stepsFrom(from, t), acc, cr, pf);
         } else {
             // Reference picture: the last frame before the cut, the one the decoder is stuck with.
             FramePtr ref = fs.get(pl.cutFrame - 1.0);
@@ -1920,10 +2096,11 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         if (cr.lastField.bw > 0) {
             const int w = acc.w, h = acc.h;
             if (store) cache->putAcc(t, pl.cutFrame, hash, std::move(acc), cr.refreshed);
+            ticket.done();
             mosh::Image vis;
             mosh::visualizeMotion(cr.lastField, s.range, w, h, vis, pf);
             out.fromImage(vis, R, rw, pf);
-            return kOfxStatOK;
+            return finish();
         }
     }
 
@@ -1934,11 +2111,12 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         if (store) cache->putAcc(t, pl.cutFrame, hash, acc, cr.refreshed);
         result = std::move(acc);
     }
+    ticket.done();
 
     if (s.view == 2) drawDiagnostics(result, pl, cr, out.width(), out.height());
 
     out.fromImage(result, R, rw, pf);
-    return kOfxStatOK;
+    return finish();
 }
 static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle inArgs,
                            OfxPropertySetHandle outArgs) {

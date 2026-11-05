@@ -231,6 +231,9 @@ backwards or jumping into the middle of a mosh rebuilds the chain from the
 cut (bounded by **Max Motion Steps**). Each source frame is fetched from the
 host once per render and the frame before it is kept from the previous
 render, so in-order playback asks the host for one new frame per frame.
+Hosts that render several frames at the same time during playback, like
+Resolve, get the same: each frame waits for the one before it if that is
+still being rendered, and continues from it.
 **GPU.** With Render Device on Auto the motion search and the mosh steps run
 on the GPU when there is one: an NVIDIA card through CUDA, AMD, Intel or
 other cards through OpenCL. The GPU follows the CPU code operation for

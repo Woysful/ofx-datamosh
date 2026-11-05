@@ -25,8 +25,11 @@ Things that differ between hosts and are handled:
   are scaled with the picture, so a proxy looks like a smaller copy of the
   full-resolution result rather than a chunkier one. It is still an
   approximation; final renders at full resolution are exact.
-* Hosts that render several frames at once, out of order: the caches are
-  shared safely and give the same result as playing in order, only slower.
+* Hosts that render several frames at once, out of order (Resolve during
+  playback): a frame whose previous frame is still being rendered waits for
+  it and then takes one step, instead of rebuilding the chain from the cut,
+  and a frame can also continue from an older cached frame. The result is
+  the same as playing in order.
 
 The randomness in Encoder intra decisions is seeded by the absolute frame
 number the host passes in, so the same clip placed at another time on a

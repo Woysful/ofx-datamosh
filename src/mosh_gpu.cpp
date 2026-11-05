@@ -246,6 +246,18 @@ bool Session::restoreAcc(const void* owner, double t, double cut, uint64_t hash,
     return false;
 }
 
+double Session::latestAcc(const void* owner, double t, double cut, uint64_t hash) const {
+    double best = -HUGE_VAL;
+    if (failed_) return best;
+    for (const DevAcc& a : e_.accs) {
+        const double d = t - a.t;
+        if (a.owner == owner && a.cut == cut && a.hash == hash && a.t >= cut && d > 0.5 &&
+            std::fabs(d - std::round(d)) < 1e-6 && a.t > best)
+            best = a.t;
+    }
+    return best;
+}
+
 bool Session::storeAcc(const void* owner, double t, double cut, uint64_t hash, const std::vector<uint8_t>& refreshed) {
     if (failed_ || !e_.acc) return false;
     Engine& e = e_;

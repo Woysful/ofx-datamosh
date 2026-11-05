@@ -5,6 +5,7 @@
 // Images are handed to the plugin bottom-up, like real OFX hosts do.
 #include <dlfcn.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <clocale>
@@ -57,8 +58,10 @@ static OfxStatus propSetIntN(OfxPropertySetHandle h, const char* n, int c, const
 static OfxStatus propGetPointer(OfxPropertySetHandle h, const char* n, int idx, void** v) {
     auto it = PS(h)->p.find(n); if (it == PS(h)->p.end() || idx >= (int)it->second.size()) { fprintf(stderr, "  [host] missing pointer prop %s\n", n); return kOfxStatErrUnknown; }
     *v = it->second[idx]; return kOfxStatOK; }
+static std::mutex gHostMutex;  // MOCK_CONCURRENT: guards what renders share in the host
 static OfxStatus propGetString(OfxPropertySetHandle h, const char* n, int idx, char** v) {
     auto it = PS(h)->s.find(n); if (it == PS(h)->s.end() || idx >= (int)it->second.size()) { fprintf(stderr, "  [host] missing string prop %s\n", n); return kOfxStatErrUnknown; }
+    std::lock_guard<std::mutex> g(gHostMutex);
     PS(h)->owned.emplace_back(new std::string(it->second[idx])); *v = const_cast<char*>(PS(h)->owned.back()->c_str()); return kOfxStatOK; }
 static OfxStatus propGetDouble(OfxPropertySetHandle h, const char* n, int idx, double* v) {
     auto it = PS(h)->d.find(n); if (it == PS(h)->d.end() || idx >= (int)it->second.size()) { fprintf(stderr, "  [host] missing double prop %s\n", n); return kOfxStatErrUnknown; }
@@ -225,9 +228,17 @@ static OfxStatus clipGetHandle(OfxImageEffectHandle e, const char* name, OfxImag
     return kOfxStatOK;
 }
 static OfxStatus clipGetPropertySet(OfxImageClipHandle c, OfxPropertySetHandle* p) { *p = H(&reinterpret_cast<Clip*>(c)->props); return kOfxStatOK; }
+static std::vector<Clip*> gClips;           // every clip, for clipReleaseImage
+static int gFetchMs = 0;                    // MOCK_FETCH_MS: cost of each source frame fetch
+static thread_local Clip::Live* tlOutImage; // output image fetched by this thread's render
+static thread_local int tlFetches;          // source frames fetched by this thread's render
 static OfxStatus clipGetImage(OfxImageClipHandle ch, OfxTime t, const OfxRectD*, OfxPropertySetHandle* out) {
     Clip* c = reinterpret_cast<Clip*>(ch);
-    c->requested.push_back(t);
+    const bool isOut = c->name == kOfxImageEffectOutputClipName;
+    if (!isOut) {
+        ++tlFetches;
+        if (gFetchMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(gFetchMs));
+    }
     auto live = std::make_unique<Clip::Live>();
     // MOCK_SCALE: images at a render scale (nearest-neighbour downsample).
     // MOCK_PAD: source images carry an extra border of garbage around the
@@ -255,12 +266,23 @@ static OfxStatus clipGetImage(OfxImageClipHandle ch, OfxTime t, const OfxRectD*,
     p.s[kOfxImageEffectPropPixelDepth] = {kOfxBitDepthFloat};
     p.d[kOfxImagePropPixelAspectRatio] = {1.0};
     *out = H(&p);
+    std::lock_guard<std::mutex> g(gHostMutex);
+    c->requested.push_back(t);
+    if (isOut) tlOutImage = live.get();
     c->live.push_back(std::move(live));
     return kOfxStatOK;
 }
 static OfxStatus clipReleaseImage(OfxPropertySetHandle img) {
-    // find owner: brute force over all clips is overkill; just leave it, memory is freed at clip teardown
-    (void)img;
+    // Source images are freed; output images stay until the host has read them.
+    std::lock_guard<std::mutex> g(gHostMutex);
+    for (Clip* c : gClips) {
+        if (c->name == kOfxImageEffectOutputClipName) continue;
+        for (size_t i = 0; i < c->live.size(); ++i)
+            if (H(&c->live[i]->props) == img) {
+                c->live.erase(c->live.begin() + (long)i);
+                return kOfxStatOK;
+            }
+    }
     return kOfxStatOK;
 }
 static OfxStatus clipGetRoD(OfxImageClipHandle ch, OfxTime, OfxRectD* r) { Clip* c = reinterpret_cast<Clip*>(ch); *r = {0, 0, (double)c->w, (double)c->h}; return kOfxStatOK; }
@@ -371,6 +393,7 @@ int main(int argc, char** argv) {
     if (const char* e = getenv("MOCK_SCALE")) gScale = atof(e);
     if (const char* e = getenv("MOCK_PAD")) gPad = atoi(e);
     if (const char* e = getenv("MOCK_OFFSET")) gOffX = gOffY = atoi(e);
+    if (const char* e = getenv("MOCK_FETCH_MS")) gFetchMs = atoi(e);
     gNoKeyApi = getenv("MOCK_NO_KEYAPI") != nullptr;
     if (const char* e = getenv("MOCK_LOCALE")) if (!setlocale(LC_ALL, e)) fprintf(stderr, "locale %s not available\n", e);
     gHostProps.s[kOfxPropName] = {"mock.host"};
@@ -447,6 +470,7 @@ int main(int argc, char** argv) {
         *to = std::move(toData); to->name = kOfxImageEffectTransitionSourceToClipName;
     }
     out->w = w; out->h = h;
+    for (auto& kv : inst.clips) gClips.push_back(kv.second.get());
     for (Clip* c : {from, to, out}) {
         c->props.d[kOfxImageEffectPropFrameRange] = {gT0, gT0 + gDur};
         c->props.d[kOfxImageEffectPropFrameRate] = {30.0};
@@ -569,6 +593,73 @@ int main(int argc, char** argv) {
     if (!fo) return 1;
     double renderMs = 0;
     int renders = 0;
+    const bool times = getenv("MOCK_TIMES") != nullptr;  // per-frame render time and source fetches
+    const int concurrent = getenv("MOCK_CONCURRENT") ? atoi(getenv("MOCK_CONCURRENT")) : 0;
+    if (concurrent > 0) {
+        // Like a host playing back: n renders in flight, started in frame
+        // order, finishing in any order. Output is written at each frame's slot.
+        const size_t frameBytes = getenv("MOCK_FLOAT") ? (size_t)w * h * 4 * sizeof(float) : rgbOut.size();
+        std::atomic<int> next{0};
+        std::atomic<bool> failed{false};
+        std::mutex outM;
+        const auto wall0 = std::chrono::steady_clock::now();
+        auto worker = [&]() {
+            std::vector<unsigned char> rgb(rgbOut.size());
+            for (int i; (i = next++) < total && !failed;) {
+                const double t = gT0 + i;
+                PropSet inArgs, outArgs, idOut;
+                inArgs.d[kOfxPropTime] = {t};
+                inArgs.i[kOfxImageEffectPropRenderWindow] = {gOffX, gOffY, gOffX + w, gOffY + h};
+                inArgs.d[kOfxImageEffectPropRenderScale] = {1.0, 1.0};
+                inArgs.i[kOfxPropIsInteractive] = {0};
+                pl->mainEntry(kOfxImageEffectActionGetFramesNeeded, &inst, H(&inArgs), H(&outArgs));
+                const std::vector<float>* img = nullptr;
+                tlFetches = 0;
+                tlOutImage = nullptr;
+                const auto r0 = std::chrono::steady_clock::now();
+                if (pl->mainEntry(kOfxImageEffectActionIsIdentity, &inst, H(&inArgs), H(&idOut)) == kOfxStatOK) {
+                    img = &source->frames[std::min(i, (int)source->frames.size() - 1)].rgba;
+                } else {
+                    if (pl->mainEntry(kOfxImageEffectActionRender, &inst, H(&inArgs), nullptr) != kOfxStatOK || !tlOutImage) {
+                        fprintf(stderr, "render %d failed\n", i);
+                        failed = true;
+                        return;
+                    }
+                    img = &tlOutImage->data;
+                }
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+                std::lock_guard<std::mutex> g(outM);
+                if (getenv("MOCK_FLOAT")) {
+                    fseek(fo, (long)(frameBytes * i), SEEK_SET);
+                    fwrite(img->data(), 1, frameBytes, fo);
+                } else {
+                    toRgb(*img);
+                    fseek(fo, (long)(frameBytes * i), SEEK_SET);
+                    fwrite(rgbOut.data(), 1, frameBytes, fo);
+                }
+                if (tlOutImage) {
+                    std::lock_guard<std::mutex> h(gHostMutex);
+                    for (size_t k = 0; k < out->live.size(); ++k)
+                        if (out->live[k].get() == tlOutImage) { out->live.erase(out->live.begin() + (long)k); break; }
+                    renderMs += ms;
+                    ++renders;
+                }
+                if (times) printf("frame %d t=%.0f %.1f ms fetches %d\n", i, t, ms, tlFetches);
+            }
+        };
+        std::vector<std::thread> th;
+        for (int k = 0; k < concurrent; ++k) th.emplace_back(worker);
+        for (auto& x : th) x.join();
+        fclose(fo);
+        if (failed) return 1;
+        const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
+        printf("render: %d calls, %.0f ms total, %.1f ms avg, wall %.0f ms\n", renders, renderMs,
+               renders ? renderMs / renders : 0.0, wall);
+        CHECK(pl->mainEntry(kOfxActionDestroyInstance, &inst, nullptr, nullptr), "destroy");
+        CHECK(pl->mainEntry(kOfxActionUnload, nullptr, nullptr, nullptr), "unload");
+        printf("done\n");
+        return 0;
+    }
     for (int i = 0; i < total; ++i) {
         const double t = gT0 + i;
         PropSet inArgs, outArgs;
@@ -605,9 +696,12 @@ int main(int argc, char** argv) {
         if (getenv("MOCK_PURGE"))  // render every frame from a cold cache, like scrubbing
             CHECK(pl->mainEntry(kOfxActionPurgeCaches, &inst, nullptr, nullptr), "purgeCaches");
         const auto r0 = std::chrono::steady_clock::now();
+        tlFetches = 0;
         CHECK(pl->mainEntry(kOfxImageEffectActionRender, &inst, H(&inArgs), nullptr), "render");
-        renderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+        renderMs += ms;
         ++renders;
+        if (times) printf("frame %d t=%.0f %.1f ms fetches %d\n", i, t, ms, tlFetches);
         if (out->live.empty()) { fprintf(stderr, "render did not fetch output image\n"); return 1; }
         if (getenv("MOCK_FLOAT")) {  // raw float RGBA of the output image, for exact comparisons
             const std::vector<float>& s = out->live.back()->data;
@@ -620,10 +714,11 @@ int main(int argc, char** argv) {
                 for (int x = 0; x < w; ++x)
                     memcpy(&up[((size_t)y * w + x) * 4], &s[((size_t)std::min(sh - 1, (int)(y * gScale)) * sw + std::min(sw - 1, (int)(x * gScale))) * 4], 4 * sizeof(float));
             toRgb(up);
+            fwrite(rgbOut.data(), 1, rgbOut.size(), fo);
         } else {
             toRgb(out->live.back()->data);
+            fwrite(rgbOut.data(), 1, rgbOut.size(), fo);
         }
-        fwrite(rgbOut.data(), 1, rgbOut.size(), fo);
         if (i == 1 || i == total / 2) {
             printf("frame %d: fetched From at", i); for (double x : from->requested) printf(" %.0f", x);
             printf(" | To at"); for (double x : to->requested) printf(" %.0f", x); printf("\n");
