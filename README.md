@@ -21,16 +21,28 @@ same thing in software, per frame:
    number you give.
 2. Takes the last frame before the cut as the reference picture.
 3. Estimates block motion between consecutive frames of the new shot the way
-   an encoder does: hierarchical block matching, median-smoothed vector
-   field, textureless blocks inherit their neighbours' vector, hopeless
-   blocks become intra blocks.
-4. Drags the reference along those vectors and adds each step's prediction
-   residual, which bleeds the new colours in. Optionally decodes every
-   P-frame several times (duplicated P-frames, the "bloom").
-5. Brings the real picture back: by refreshing the regions where the new
-   shot moves first inside the mosh, by letting the new shot's shapes appear
-   before its colours, through its bright areas, block by block, as a
-   dissolve or as a hard cut.
+   an encoder does: hierarchical block matching refined to half a pixel,
+   median-smoothed vector field, textureless blocks inherit their
+   neighbours' vector.
+4. Makes the encoder's intra decision for every block: where predicting a
+   block of the new shot costs more than coding it from scratch, the block
+   is coded intra and shows the new shot as it is. This starts on the first
+   frame after the cut, so the new shot replaces the old one bit by bit,
+   just as in a real stream with a deleted keyframe.
+5. Drags the reference (and every fresh block) along the vectors with
+   interpolation and adds each step's prediction residual, which carries
+   the new shot's changes in. Optionally decodes every P-frame several times
+   (duplicated P-frames, the "bloom").
+6. Heals the stream by the end of the mosh: by default the way a real one
+   heals (more and more intra blocks, fresh regions growing), or with one
+   of the stylised recovery modes.
+
+The default look was tuned against a real MPEG-4 ASP (Xvid-class) stream of
+the same clips with the keyframe at the cut deleted:
+
+![real mosh vs plugin](docs/natural.jpg)
+
+*Frames 2, 7, 12, 17, 22 and 27 after the cut, 30-frame mosh.*
 
 ## Install
 
@@ -189,7 +201,8 @@ Dark Areas First outside Luma reveal, and so on).
 | Parameter | Default | Meaning |
 |---|---|---|
 | Mosh Length | 30 | Frames after the cut the mosh lasts, recovery included. |
-| Residual Strength | 0.6 | 0 = pure smear of the old frame, 1 = codec-accurate, >1 overdrive. |
+| Residual Strength | 1.0 | 0 = pure smear of the old frame, 1 = codec-accurate, >1 overdrive. |
+| New Data Rate | 0.6 | How readily blocks of the new shot are coded intra (fresh) instead of predicted, from the first frame after the cut. 0 = never, about 0.5 behaves like Xvid, higher replaces the old picture faster. |
 | Bloom (P-frame Repeat) | 1 | Decode each P-frame N times. 2-4 gives the classic melting, over-saturated look. |
 | Motion Scale | 1.0 | Multiplies vectors. >1 exaggerates, <0 inverts. |
 | Clamp Levels | on | Keep RGB in 0..1 like an 8-bit decoder. |
@@ -200,7 +213,8 @@ Dark Areas First outside Luma reveal, and so on).
 |---|---|---|
 | Block Size | 16 | Macroblock size in px. Bigger = chunkier and faster. |
 | Search Range | 48 | Max motion per step, px. Raise for very fast pans. |
-| Intra Threshold | 0.35 | Blocks predicted worse than this show the new picture directly. 1 = off. |
+| Half-pixel Motion | on | Half-pixel vectors with interpolation, like MPEG-4 and H.264; the smear softens as it travels. |
+| Intra Threshold | 0.35 | Extra, absolute intra rule: blocks predicted worse than this always show the new picture. 1 = off. |
 | Smooth Vectors | on | Median filter on the vector field. |
 | Fill Flat Areas | on | Textureless blocks take their neighbours' motion so flat regions flow too. |
 
@@ -208,8 +222,8 @@ Dark Areas First outside Luma reveal, and so on).
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Recovery | Motion refresh | How the real picture comes back, see below. |
-| Recovery Start | 0.8 | Fraction of the mosh at which the real picture starts to return. |
+| Recovery | Natural | How the real picture comes back, see below. |
+| Recovery Start | 0.8 | Fraction of the mosh at which the real picture starts to return. Not used by Natural, which heals over the whole mosh. |
 | Recovery Curve | Linear | Pace of the recovery: Linear, Smooth (slow-fast-slow), Ease in (slow start), Ease out (slow end). |
 | Softness | 0.5 | How gradual the recovery is; what exactly it softens depends on the mode, see below. |
 | Dark Areas First | off | Luma reveal only: reveal dark areas first. |
@@ -227,11 +241,12 @@ Dark Areas First outside Luma reveal, and so on).
 
 ![recovery modes](docs/recovery.jpg)
 
-*Frames 14, 18, 21, 24 and 27 of a 30-frame mosh, Recovery Start 0.4,
-Softness 0.5.*
+*Frames 14, 18, 21, 24 and 27 of a 30-frame mosh, Recovery Start 0.4
+(Natural ignores it), Softness 0.5, other settings at their defaults.*
 
 | Mode | What happens | Softness controls |
 |---|---|---|
+| Natural | The stream heals the way a real one does, over the whole mosh from the cut on: the encoder codes more and more blocks intra, regions that already show the new shot grow outwards, and a few blocks in static areas are refreshed at random. Whatever is still stale fades in over the last 15%. Recovery Start is not used; Recovery Curve sets the pace. | - |
 | Motion refresh | The stream recovers inside the mosh, like an intra-refresh encoder. Regions where the new shot moves or changes come back first, whole areas at a time; static areas stay moshed longest. Refreshed blocks keep being decoded as P-blocks, so the smear around them keeps flowing in until it washes out. | how long the smear lingers in refreshed blocks |
 | Structure first | The shapes and texture of the new shot appear first, painted with the smeared colours of the old one; then the colours follow. The smoothest, most "one picture turning into another" option. | how long the old colours stay after the shapes arrive |
 | Colour first | The reverse of Structure first: the colours of the new shot wash in under the smeared detail of the old one, then the detail follows. | how long the smeared detail stays after the colours arrive |
@@ -243,17 +258,23 @@ Softness 0.5.*
 | Dissolve | Crossfade from the moshed picture to the real one. | - |
 | Hard cut | The real picture as soon as recovery starts. | - |
 
-Up to version 1.4 the default was Block refresh, and Softness did not
-exist. To get the 1.4 look back, choose Block refresh and set Softness to 0;
-the result is then identical to 1.4.
+All modes except Natural start at Recovery Start. New Data Rate works in
+every mode, so the new shot starts coming in at the cut with any of them;
+set it to 0 for a pure smear until recovery.
+
+To get the 1.4 look back exactly: Recovery Block refresh, Softness 0, New
+Data Rate 0, Half-pixel Motion off, Residual Strength 0.6.
 
 Looks to start from:
 
 * Classic melt: Bloom 2-4, Residual 0.4-0.8, Motion Scale 1-1.5.
+* Natural transition, like a real mosh: the defaults. Raise New Data Rate
+  for a faster hand-over, lower it (0.3-0.4) and set Recovery Curve to
+  Ease in for a long smear that heals late.
 * Long, flowing transition between shots: Recovery Motion refresh or
   Structure first, Recovery Start 0.4-0.5, Recovery Curve Smooth.
 * Pure liquid smear of the old picture, no new colours: Residual 0,
-  Intra Threshold 1.
+  New Data Rate 0, Intra Threshold 1.
 * Short glitch: Mosh Length 12, Recovery Start 0.6, Recovery Hard cut.
 * Glitchy hand-off: Recovery Slice, Softness 0.2-0.4, Block Size 32.
 
@@ -271,7 +292,8 @@ Set **View** to **Diagnostics** on a frame just after the cut:
   whether the frame reused the previous result or rebuilt the chain.
 * `Q` is the recovery progress (0..1, after the Recovery Curve), `REC` the
   recovery mode number, `REFR` the share of blocks Motion refresh has
-  already refreshed, in percent.
+  already refreshed (Natural: blocks that already carry the new shot), in
+  percent. `INTRA` is the share of blocks coded intra in this frame.
 
 ## Build from source
 

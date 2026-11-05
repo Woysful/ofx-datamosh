@@ -58,6 +58,12 @@ struct MotionField {
     // with a hopeless prediction as intra blocks; we flag them the same way.
     std::vector<float> err;
     std::vector<uint8_t> intra;
+    // Optional, filled when MotionParams asks for them:
+    std::vector<float> fx, fy;  // sub-pixel vectors (half-pel), replace dx/dy in the mosh step
+    std::vector<float> sse;     // mean squared luma error of the chosen prediction
+    std::vector<float> var;     // luma variance of the block itself (what intra coding costs)
+
+    bool subpel() const { return !fx.empty(); }
 
     int index(int bx, int by) const { return by * bw + bx; }
 };
@@ -121,7 +127,34 @@ struct MotionParams {
     // inherit the median vector of textured blocks around them.
     bool fillFlat = true;
     float flatThreshold = 0.015f;
+    // Refine vectors to half a pixel; the mosh step then interpolates, which
+    // is what makes the smear of a real decoder soften as it travels.
+    bool halfPel = false;
+    // Encoder-style intra decision, 0 = off: a block of the new shot is coded
+    // intra when predicting it costs more than coding it from scratch.
+    float intraRate = 0.f;
+    bool blockStats = false;  // fill sse/var even when intraRate is 0
 };
+
+// Thresholds of the encoder intra decision for an eagerness e in (0,1]:
+// intra when sse > k * var + bias. e around 0.5 matches an MPEG-4 ASP encoder.
+struct IntraRule {
+    float k = 0.f, bias = 0.f;
+};
+inline IntraRule intraRule(float e) {
+    e = std::min(std::max(e, 0.f), 1.f);
+    IntraRule r;
+    r.k = 2.5f * (1.f - e);
+    r.bias = 0.008f * (1.f - e) * (1.f - e) + 0.0002f;
+    return r;
+}
+
+inline float bilinearLuma(const Luma& L, float x, float y) {
+    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+    const float ax = x - (float)x0, ay = y - (float)y0;
+    const float a = L.at(x0, y0), b = L.at(x0 + 1, y0), c = L.at(x0, y0 + 1), d = L.at(x0 + 1, y0 + 1);
+    return (a + ax * (b - a)) * (1.f - ay) + (c + ax * (d - c)) * ay;
+}
 
 // Hierarchical block matching: full search at the coarsest pyramid level,
 // then +-2 steps of refinement at every finer level down to full resolution.
@@ -281,6 +314,63 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
 
     if (mp.intraThreshold < 1.f)
         for (size_t i = 0; i < nb; ++i) mf.intra[i] = mf.err[i] > mp.intraThreshold ? 1 : 0;
+
+    if (mp.halfPel || mp.intraRate > 0.f || mp.blockStats) {
+        const Luma& Lp = Pp[0];
+        const Luma& Lc = Pc[0];
+        if (mp.halfPel) {
+            mf.fx.assign(nb, 0.f);
+            mf.fy.assign(nb, 0.f);
+        }
+        mf.sse.assign(nb, 0.f);
+        mf.var.assign(nb, 0.f);
+        pf(mf.bh, [&](int b0, int b1) {
+            for (int by = b0; by < b1; ++by)
+                for (int bx = 0; bx < mf.bw; ++bx) {
+                    const int i = mf.index(bx, by);
+                    const int x0 = bx * mf.block, y0 = by * mf.block;
+                    const int x1 = std::min(x0 + mf.block, cur.w), y1 = std::min(y0 + mf.block, cur.h);
+                    const float cnt = float((x1 - x0) * (y1 - y0));
+                    auto sseAt = [&](float vx, float vy) {
+                        float s = 0.f;
+                        for (int y = y0; y < y1; ++y)
+                            for (int x = x0; x < x1; ++x) {
+                                const float d = Lc.v[(size_t)y * Lc.w + x] - bilinearLuma(Lp, x + vx, y + vy);
+                                s += d * d;
+                            }
+                        return s / cnt;
+                    };
+                    float vx = (float)mf.dx[i], vy = (float)mf.dy[i];
+                    float best = sseAt(vx, vy);
+                    if (mp.halfPel) {
+                        const float cx = vx, cy = vy;
+                        for (int oy = -1; oy <= 1; ++oy)
+                            for (int ox = -1; ox <= 1; ++ox) {
+                                if (!ox && !oy) continue;
+                                const float e = sseAt(cx + 0.5f * ox, cy + 0.5f * oy);
+                                if (e < best) { best = e; vx = cx + 0.5f * ox; vy = cy + 0.5f * oy; }
+                            }
+                        mf.fx[i] = vx;
+                        mf.fy[i] = vy;
+                    }
+                    float m = 0.f, m2 = 0.f;
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = x0; x < x1; ++x) {
+                            const float l = Lc.v[(size_t)y * Lc.w + x];
+                            m += l;
+                            m2 += l * l;
+                        }
+                    m /= cnt;
+                    mf.sse[i] = best;
+                    mf.var[i] = std::max(0.f, m2 / cnt - m * m);
+                }
+        });
+        if (mp.intraRate > 0.f) {
+            const IntraRule r = intraRule(mp.intraRate);
+            for (size_t i = 0; i < nb; ++i)
+                if (mf.sse[i] > r.k * mf.var[i] + r.bias) mf.intra[i] = 1;
+        }
+    }
     return mf;
 }
 
@@ -291,6 +381,16 @@ struct StepParams {
     bool clampLevels = true;   // keep RGB within [0,1]
     bool intraBlocks = true;   // let hopeless blocks show the incoming picture
 };
+
+inline void bilinear(const Image& im, float x, float y, float* o) {
+    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+    const float ax = x - (float)x0, ay = y - (float)y0;
+    const float* a = im.clampedAt(x0, y0);
+    const float* b = im.clampedAt(x0 + 1, y0);
+    const float* c = im.clampedAt(x0, y0 + 1);
+    const float* d = im.clampedAt(x0 + 1, y0 + 1);
+    for (int k = 0; k < 4; ++k) o[k] = (a[k] + ax * (b[k] - a[k])) * (1.f - ay) + (c[k] + ax * (d[k] - c[k])) * ay;
+}
 
 // One "P-frame decode" on the wrong reference:
 //   accOut(x) = accIn(x + mv) + residual * (cur(x) - prev(x + mv))
@@ -309,10 +409,21 @@ inline void moshStepOnce(const Image& prev, const Image& cur, const MotionField&
                     o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = c[3];
                     continue;
                 }
-                const int dx = (int)std::lround(mf.dx[i] * sp.motionScale);
-                const int dy = (int)std::lround(mf.dy[i] * sp.motionScale);
-                const float* a = accIn.clampedAt(x + dx, y + dy);
-                const float* p = prev.clampedAt(x + dx, y + dy);
+                float ia[4], ip[4];
+                const float* a;
+                const float* p;
+                if (mf.subpel()) {
+                    const float fx = x + mf.fx[i] * sp.motionScale, fy = y + mf.fy[i] * sp.motionScale;
+                    bilinear(accIn, fx, fy, ia);
+                    bilinear(prev, fx, fy, ip);
+                    a = ia;
+                    p = ip;
+                } else {
+                    const int dx = (int)std::lround(mf.dx[i] * sp.motionScale);
+                    const int dy = (int)std::lround(mf.dy[i] * sp.motionScale);
+                    a = accIn.clampedAt(x + dx, y + dy);
+                    p = prev.clampedAt(x + dx, y + dy);
+                }
                 for (int ch = 0; ch < 3; ++ch) {
                     float v = a[ch] + sp.residual * (c[ch] - p[ch]);
                     if (sp.clampLevels) v = std::min(std::max(v, 0.f), 1.f);
@@ -346,8 +457,9 @@ enum class Recovery {
     Settle = 7,
     Wipe = 8,
     Slice = 9,
+    Natural = 10,
 };
-static const int kRecoveryCount = 10;
+static const int kRecoveryCount = 11;
 enum class Curve { Linear = 0, Smooth = 1, EaseIn = 2, EaseOut = 3 };
 enum class Direction { LeftToRight = 0, RightToLeft = 1, TopToBottom = 2, BottomToTop = 3, FromCentre = 4, ToCentre = 5 };
 static const int kDirectionCount = 6;
@@ -419,6 +531,91 @@ inline void boxBlur(const Image& src, int r, Image& out, const ParallelFor& pf) 
     });
 }
 
+// Natural recovery: the stream heals the way a real one does after a lost
+// keyframe. fresh[] marks blocks that already carry data of the new shot
+// (they were coded intra, or their content was dragged in from such a
+// block). Each step:
+//   - the encoder grows more eager to code blocks intra (intraRule),
+//   - stale blocks next to fresh ones turn intra with a probability that
+//     rises with q, so new-shot regions grow outwards like blobs,
+//   - a few stale blocks anywhere are seeded at random (periodic intra
+//     refresh), so static areas far from any motion heal too.
+// q is the healing progress over the whole mosh. frame keeps the random
+// choices stable across renders.
+struct NaturalStep {
+    float baseRate = 0.6f;  // New Data Rate
+    float q = 0.f;
+    float motionScale = 1.f;
+    int seed = 0;
+    long frame = 0;
+};
+
+inline void naturalIntra(MotionField& mf, const NaturalStep& ns, const std::vector<uint8_t>& fresh) {
+    const size_t nb = mf.intra.size();
+    const float q = clamp01(ns.q);
+    if (q <= 0.f) return;
+    if (q >= 1.f) {
+        std::fill(mf.intra.begin(), mf.intra.end(), 1);
+        return;
+    }
+    const IntraRule r = intraRule(ns.baseRate + (1.f - ns.baseRate) * q * q);
+    const float grow = 0.4f * q * q;       // per fresh neighbour, per step
+    const float seedP = 0.02f * q * q;     // random refresh of isolated blocks
+    const bool stats = mf.sse.size() == nb && mf.var.size() == nb;
+    const bool haveFresh = fresh.size() == nb;
+    std::vector<uint8_t> out = mf.intra;
+    for (int by = 0; by < mf.bh; ++by)
+        for (int bx = 0; bx < mf.bw; ++bx) {
+            const int i = mf.index(bx, by);
+            if (out[i] || (haveFresh && fresh[i])) continue;
+            if (stats && mf.sse[i] > r.k * mf.var[i] + r.bias) { out[i] = 1; continue; }
+            int n = 0;
+            if (haveFresh)
+                for (int oy = -1; oy <= 1; ++oy)
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        const int qx = bx + ox, qy = by + oy;
+                        if ((ox || oy) && qx >= 0 && qy >= 0 && qx < mf.bw && qy < mf.bh && fresh[mf.index(qx, qy)])
+                            ++n;
+                    }
+            const float p = 1.f - std::pow(1.f - grow, (float)n) * (1.f - seedP);
+            if (blockHash(bx, by, ns.seed * 7919 + (int)ns.frame) < p) out[i] = 1;
+        }
+    mf.intra.swap(out);
+}
+
+// After the step: carry the fresh marks along the motion, and fade in what
+// is still stale over the last stretch so the end of the mosh does not pop.
+inline void naturalAfter(const Image& cur, const MotionField& mf, const NaturalStep& ns, std::vector<uint8_t>& fresh,
+                         Image& acc, const ParallelFor& pf) {
+    const size_t nb = mf.intra.size();
+    if (fresh.size() != nb) fresh.assign(nb, 0);
+    std::vector<uint8_t> next(nb, 0);
+    for (int by = 0; by < mf.bh; ++by)
+        for (int bx = 0; bx < mf.bw; ++bx) {
+            const int i = mf.index(bx, by);
+            if (mf.intra[i]) { next[i] = 1; continue; }
+            const float vx = (mf.subpel() ? mf.fx[i] : (float)mf.dx[i]) * ns.motionScale;
+            const float vy = (mf.subpel() ? mf.fy[i] : (float)mf.dy[i]) * ns.motionScale;
+            const int sx = (int)std::floor(((float)bx + 0.5f) + vx / (float)mf.block);
+            const int sy = (int)std::floor(((float)by + 0.5f) + vy / (float)mf.block);
+            if (sx >= 0 && sy >= 0 && sx < mf.bw && sy < mf.bh) next[i] = fresh[mf.index(sx, sy)];
+        }
+    fresh.swap(next);
+
+    const float tail = smoothstep01((ns.q - 0.85f) / 0.15f);
+    if (tail <= 0.f) return;
+    pf(cur.h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const int by = std::min(y / mf.block, mf.bh - 1);
+            for (int x = 0; x < cur.w; ++x) {
+                if (fresh[mf.index(std::min(x / mf.block, mf.bw - 1), by)]) continue;
+                float* a = acc.at(x, y);
+                const float* c = cur.at(x, y);
+                for (int ch = 0; ch < 4; ++ch) a[ch] += tail * (c[ch] - a[ch]);
+            }
+        }
+    });
+}
 // Motion refresh: the stream "recovers" the way an intra-refresh encoder
 // does, inside the decode loop instead of as a composite on top of it. Blocks
 // where the new shot changes the most are refreshed first; refreshed blocks
@@ -578,8 +775,9 @@ inline SliceLayout makeSlices(const ComposeParams& cp, int w, int h, float s) {
 //                   over a window set by softness (0 = they pop).
 //   Dissolve:       crossfade.
 //   HardCut:        the real picture as soon as recovery starts.
-//   MotionRefresh:  done inside the mosh chain (refreshStep); here only the
-//                   final frame snaps to the real picture.
+//   MotionRefresh,
+//   Natural:        done inside the mosh chain (refreshStep, naturalIntra);
+//                   here only the final frame snaps to the real picture.
 //   StructureFirst: the edges and texture of the new shot appear first,
 //                   painted with the smeared colours; the colours follow.
 //   LumaReveal:     the new shot shows through its bright areas first.
@@ -699,7 +897,8 @@ inline void compose(const Image& acc, const Image& to, const ComposeParams& cp, 
                         break;
                     }
                     case Recovery::Dissolve: k = q; break;
-                    case Recovery::MotionRefresh: k = q >= 1.f ? 1.f : 0.f; break;
+                    case Recovery::MotionRefresh:
+                    case Recovery::Natural: k = q >= 1.f ? 1.f : 0.f; break;
                     case Recovery::LumaReveal: {
                         const float* kp = key.at(x, y);
                         float l = clamp01(0.299f * kp[0] + 0.587f * kp[1] + 0.114f * kp[2]);
