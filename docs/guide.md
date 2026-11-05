@@ -56,10 +56,10 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Markers, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). |
+| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Markers, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). Only the setting of the chosen way is shown below it (hosts that cannot hide parameters grey the others out). |
+| Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 | Cut Frame | 0 | Manual mode: first frame of the new shot (Repeat: the first repeated frame), in the clip's own frame numbers (Diagnostics shows `T`). |
 | Cut Markers | 0 | Keyframes mode: every keyframe of this parameter is a cut (Repeat: the start of a repeat). The value does nothing; only where the keyframes are matters. |
-| Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 
 **Mosh**
 
@@ -200,10 +200,10 @@ on the very first frame of the clip is ignored, because there is no old
 picture before it. Diagnostics shows `KEYS n`, the number of keyframes the
 plugin sees.
 
-Development builds before this one used a one-entry menu for Cut Markers,
-whose keyframes Resolve does not show. Projects made with them keep their
-cuts; the first time any setting of the effect is changed, those keyframes
-move to the new Cut Markers.
+Earlier development builds kept Cut Markers in other parameters (a
+one-entry menu, whose keyframes Resolve does not show, then a fractional
+number). Projects made with them keep their cuts; the first time any
+setting of the effect is changed, those keyframes move to Cut Markers.
 
 Some hosts do not tell plugins where keyframes are. There Diagnostics shows
 `KEYS UNKNOWN` and Keyframes mode finds no cut; use Auto or Manual frame

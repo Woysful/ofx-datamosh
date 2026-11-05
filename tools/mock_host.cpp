@@ -598,9 +598,11 @@ int main(int argc, char** argv) {
                 auto& pp = kv.second->props;
                 auto par = pp.s.find(kOfxParamPropParent);
                 auto en = pp.i.find(kOfxParamPropEnabled);
-                printf("  %-16s %-12s group=%-12s enabled=%s\n", kv.first.c_str(), kv.second->type.c_str() + 12,
+                auto se = pp.i.find(kOfxParamPropSecret);
+                printf("  %-16s %-12s group=%-12s enabled=%s%s\n", kv.first.c_str(), kv.second->type.c_str() + 12,
                        par != pp.s.end() ? par->second[0].c_str() : "-",
-                       en != pp.i.end() ? (en->second[0] ? "yes" : "NO") : "default");
+                       en != pp.i.end() ? (en->second[0] ? "yes" : "NO") : "default",
+                       se != pp.i.end() && se->second[0] ? " hidden" : "");
             }
         };
         dump();

@@ -107,7 +107,7 @@ Any parameter can be set after the view argument as `name=value`, e.g.
 `... out.rgb 0 recoverMode=4 recoverStart=0.4`. `MOCK_PURGE=1` drops the
 plugin's cache before every frame (like scrubbing), so the output can be
 compared with a normal sequential run; `MOCK_PARAMS=1` prints each
-parameter's group and enabled state and exits. Other switches emulate what
+parameter's group, enabled state and whether it is hidden, and exits. Other switches emulate what
 real hosts do differently: `MOCK_THREADS=n` provides the multithread suite
 with n threads, `MOCK_SCALE=0.5` renders at a render scale (output scaled
 back up), `MOCK_PAD=n` gives source images an n-pixel border beyond the
@@ -115,11 +115,12 @@ output's bounds, `MOCK_OFFSET=n` moves every image's origin to (n, n),
 `MOCK_NO_TEMPORAL=1` reports a host without temporal clip access. The host
 prints the total and average time spent in render.
 
-`MOCK_KEYS=cutKeys=1010,1030` gives a parameter keyframes at those times
+`MOCK_KEYS=cutKeyframes=1010,1030` gives a parameter keyframes at those times
 (the fake clip starts at frame 1000, the cut in it is at 1020).
 `MOCK_CHANGE=name` sends an instance-changed for that parameter, as if
 the user edited it, and lists the keyframes of every parameter afterwards
-(keyframes of the old `cutMarker` menu move to `cutKeys` then).
+(keyframes of the old `cutMarker` and `cutKeys` move to `cutKeyframes`
+then).
 `MOCK_NO_KEYAPI=1` makes the host refuse keyframe queries (Keyframes mode
 then finds no cut). `MOCK_PRESETS=1` runs the preset buttons: saves named
 presets, picks, loads and deletes them, prints the values and the Saved
