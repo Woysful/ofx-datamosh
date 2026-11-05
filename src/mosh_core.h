@@ -149,11 +149,21 @@ inline IntraRule intraRule(float e) {
     return r;
 }
 
+inline float bilinearMix(float a, float b, float c, float d, float ax, float ay) {
+    return (a + ax * (b - a)) * (1.f - ay) + (c + ax * (d - c)) * ay;
+}
+
 inline float bilinearLuma(const Luma& L, float x, float y) {
     const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
     const float ax = x - (float)x0, ay = y - (float)y0;
-    const float a = L.at(x0, y0), b = L.at(x0 + 1, y0), c = L.at(x0, y0 + 1), d = L.at(x0 + 1, y0 + 1);
-    return (a + ax * (b - a)) * (1.f - ay) + (c + ax * (d - c)) * ay;
+    float a, b, c, d;
+    if (x0 >= 0 && y0 >= 0 && x0 + 1 < L.w && y0 + 1 < L.h) {
+        const float* p = &L.v[(size_t)y0 * L.w + x0];
+        a = p[0]; b = p[1]; c = p[L.w]; d = p[L.w + 1];
+    } else {
+        a = L.at(x0, y0); b = L.at(x0 + 1, y0); c = L.at(x0, y0 + 1); d = L.at(x0 + 1, y0 + 1);
+    }
+    return bilinearMix(a, b, c, d, ax, ay);
 }
 
 // Hierarchical block matching: full search at the coarsest pyramid level,
@@ -198,12 +208,34 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
                     const int cy = ((by * mf.block + mf.block / 2) / d) - half;
                     const int pdx = mf.dx[i] / d, pdy = mf.dy[i] / d;  // parent vector at this level
 
-                    auto mad = [&](int vx, int vy) {
+                    const bool curInside = cx >= 0 && cy >= 0 && cx + ws <= Lc.w && cy + ws <= Lc.h;
+                    // Sum of |cur - prev| over the window. With a bound, gives up as soon as the
+                    // partial cost reaches it: partial sums of non-negative terms only grow, so
+                    // such a candidate could never win and the result is the same.
+                    auto sad = [&](int vx, int vy, float bound, int pen, bool& over) {
                         float s = 0.f;
-                        for (int yy = 0; yy < ws; ++yy)
-                            for (int xx = 0; xx < ws; ++xx)
-                                s += std::fabs(Lc.at(cx + xx, cy + yy) - Lp.at(cx + xx + vx, cy + yy + vy));
-                        return s * norm;
+                        over = false;
+                        const bool inside = curInside && cx + vx >= 0 && cy + vy >= 0 && cx + vx + ws <= Lp.w &&
+                                            cy + vy + ws <= Lp.h;
+                        for (int yy = 0; yy < ws; ++yy) {
+                            if (inside) {
+                                const float* pc = &Lc.v[(size_t)(cy + yy) * Lc.w + cx];
+                                const float* pp = &Lp.v[(size_t)(cy + yy + vy) * Lp.w + cx + vx];
+                                for (int xx = 0; xx < ws; ++xx) s += std::fabs(pc[xx] - pp[xx]);
+                            } else {
+                                for (int xx = 0; xx < ws; ++xx)
+                                    s += std::fabs(Lc.at(cx + xx, cy + yy) - Lp.at(cx + xx + vx, cy + yy + vy));
+                            }
+                            if (pen >= 0 && s * norm + lambda * float(pen) * float(d) >= bound) {
+                                over = true;
+                                return s;
+                            }
+                        }
+                        return s;
+                    };
+                    auto mad = [&](int vx, int vy) {
+                        bool over;
+                        return sad(vx, vy, 0.f, -1, over) * norm;
                     };
                     auto cost = [&](int vx, int vy, float m) {
                         return m + lambda * float(std::abs(vx) + std::abs(vy)) * float(d);
@@ -221,7 +253,10 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
                         for (int vy = pdy - r; vy <= pdy + r; ++vy) {
                             for (int vx = pdx - r; vx <= pdx + r; ++vx) {
                                 if (vx == pdx && vy == pdy) continue;
-                                const float m = mad(vx, vy);
+                                bool over;
+                                const float sum = sad(vx, vy, bc, std::abs(vx) + std::abs(vy), over);
+                                if (over) continue;
+                                const float m = sum * norm;
                                 const float c = cost(vx, vy, m);
                                 if (c < bc) { bc = c; bm = m; bvx = vx; bvy = vy; }
                             }
@@ -324,6 +359,31 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
         }
         mf.sse.assign(nb, 0.f);
         mf.var.assign(nb, 0.f);
+        // prev luma sampled at +0.5 px in x, y and both: every half-pel
+        // candidate then reads a plane instead of interpolating. Values are
+        // computed with bilinearLuma itself, so they are bit-identical.
+        std::vector<float> halfPlanes[3];
+        if (mp.halfPel) {
+            for (auto& hp : halfPlanes) hp.resize((size_t)Lp.w * Lp.h);
+            pf(Lp.h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    const size_t row = (size_t)y * Lp.w;
+                    for (int x = 0; x < Lp.w; ++x) {
+                        if (x + 1 < Lp.w && y + 1 < Lp.h) {
+                            const float* p = &Lp.v[row + x];
+                            const float a = p[0], b = p[1], c = p[Lp.w], d = p[Lp.w + 1];
+                            halfPlanes[0][row + x] = bilinearMix(a, b, c, d, 0.5f, 0.f);
+                            halfPlanes[1][row + x] = bilinearMix(a, b, c, d, 0.f, 0.5f);
+                            halfPlanes[2][row + x] = bilinearMix(a, b, c, d, 0.5f, 0.5f);
+                        } else {
+                            halfPlanes[0][row + x] = bilinearLuma(Lp, x + 0.5f, (float)y);
+                            halfPlanes[1][row + x] = bilinearLuma(Lp, (float)x, y + 0.5f);
+                            halfPlanes[2][row + x] = bilinearLuma(Lp, x + 0.5f, y + 0.5f);
+                        }
+                    }
+                }
+            });
+        }
         pf(mf.bh, [&](int b0, int b1) {
             for (int by = b0; by < b1; ++by)
                 for (int bx = 0; bx < mf.bw; ++bx) {
@@ -333,11 +393,30 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
                     const float cnt = float((x1 - x0) * (y1 - y0));
                     auto sseAt = [&](float vx, float vy) {
                         float s = 0.f;
-                        for (int y = y0; y < y1; ++y)
-                            for (int x = x0; x < x1; ++x) {
-                                const float d = Lc.v[(size_t)y * Lc.w + x] - bilinearLuma(Lp, x + vx, y + vy);
-                                s += d * d;
+                        // Split v into an integer offset and a half: x + v == (x + ix) + hx exactly.
+                        const int ix = (int)std::floor(vx), iy = (int)std::floor(vy);
+                        const bool hx = vx != (float)ix, hy = vy != (float)iy;
+                        const float* plane = !hx && !hy ? Lp.v.data()
+                                             : hx && !hy ? halfPlanes[0].data()
+                                             : !hx && hy ? halfPlanes[1].data()
+                                                         : halfPlanes[2].data();
+                        const bool fast = ((!hx && !hy) || mp.halfPel) && x0 + ix >= 0 && y0 + iy >= 0 &&
+                                          x1 + ix <= Lp.w && y1 + iy <= Lp.h && Lc.w == cur.w;
+                        for (int y = y0; y < y1; ++y) {
+                            const float* pc = &Lc.v[(size_t)y * Lc.w];
+                            if (fast) {
+                                const float* pp = plane + (size_t)(y + iy) * Lp.w + ix;
+                                for (int x = x0; x < x1; ++x) {
+                                    const float d = pc[x] - pp[x];
+                                    s += d * d;
+                                }
+                            } else {
+                                for (int x = x0; x < x1; ++x) {
+                                    const float d = pc[x] - bilinearLuma(Lp, x + vx, y + vy);
+                                    s += d * d;
+                                }
                             }
+                        }
                         return s / cnt;
                     };
                     float vx = (float)mf.dx[i], vy = (float)mf.dy[i];
@@ -385,10 +464,13 @@ struct StepParams {
 inline void bilinear(const Image& im, float x, float y, float* o) {
     const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
     const float ax = x - (float)x0, ay = y - (float)y0;
-    const float* a = im.clampedAt(x0, y0);
-    const float* b = im.clampedAt(x0 + 1, y0);
-    const float* c = im.clampedAt(x0, y0 + 1);
-    const float* d = im.clampedAt(x0 + 1, y0 + 1);
+    const float *a, *b, *c, *d;
+    if (x0 >= 0 && y0 >= 0 && x0 + 1 < im.w && y0 + 1 < im.h) {
+        a = im.at(x0, y0); b = a + 4; c = a + (size_t)im.w * 4; d = c + 4;
+    } else {
+        a = im.clampedAt(x0, y0); b = im.clampedAt(x0 + 1, y0);
+        c = im.clampedAt(x0, y0 + 1); d = im.clampedAt(x0 + 1, y0 + 1);
+    }
     for (int k = 0; k < 4; ++k) o[k] = (a[k] + ax * (b[k] - a[k])) * (1.f - ay) + (c[k] + ax * (d[k] - c[k])) * ay;
 }
 
