@@ -1,0 +1,131 @@
+# Development
+
+[Back to README](../README.md)
+
+## Build from source
+
+Requirements: a C++17 compiler, CMake 3.16+, git. No other dependencies;
+the OpenFX headers are fetched into `third_party/`.
+
+**Linux / macOS**
+
+```sh
+git clone https://github.com/Woysful/ofx-datamosh.git
+cd ofx-datamosh
+git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git third_party/openfx
+./build.sh --install            # build for this OS and install (asks for sudo)
+```
+
+Or with plain CMake:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./install.sh --local
+```
+
+On macOS add `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` to the configure
+step for a universal binary.
+
+**Windows** (Visual Studio 2019/2022 with the C++ workload, or the Build Tools)
+
+```powershell
+git clone https://github.com/Woysful/ofx-datamosh.git
+cd ofx-datamosh
+git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git third_party/openfx
+cmake -S . -B build -A x64
+cmake --build build --config Release
+# as Administrator:
+.\install.ps1
+```
+
+The bundle lands in `build/Datamosh.ofx.bundle/`. On Linux the C++ runtime
+is linked statically so the plugin does not clash with the libraries Resolve
+ships.
+
+**Release archives for every platform**
+
+`build.sh` builds every platform the machine has a toolchain for and writes
+`dist/ofx-datamosh-<version>-<platform>.zip` (bundle, README, LICENSE,
+install scripts). The version is the git tag on the current commit, or the
+version from `packaging/Info.plist`.
+
+```sh
+./build.sh --list              # which platforms can be built on this machine
+./build.sh                     # all of them; the rest are skipped
+./build.sh linux windows       # only these (fails if one cannot be built)
+./build.sh -c -q -v v1.5.0     # clean, quiet build labelled v1.5.0
+./build.sh -i linux            # build for Linux and install it
+./build.sh --help              # all options
+```
+
+| Option | Meaning |
+|---|---|
+| `-h`, `--help` | show usage |
+| `-l`, `--list` | show which platforms can be built here and how |
+| `-v`, `--version VER` | version label in archive names |
+| `-o`, `--output DIR` | output directory (default `dist`) |
+| `-j`, `--jobs N` | parallel compile jobs |
+| `-c`, `--clean` | delete `build-release/` and the output directory first |
+| `-n`, `--no-zip` | only build bundles, left in `build-release/<platform>/` |
+| `-q`, `--quiet` | hide compiler output, keep it in `build-release/<platform>.log` |
+| `--debug` | debug build |
+| `-i`, `--install` | install the build for this OS afterwards (uses sudo if needed) |
+| `--install-dir DIR` | install into DIR instead of the system plugin directory (implies `--install`) |
+
+| Platform | How it is built | What you need |
+|---|---|---|
+| linux | native, on Linux (x86_64 or arm64) | g++ or clang |
+| windows | MinGW-w64 cross compiler on Linux/macOS, or natively in Git Bash / MSYS2 on Windows | `g++-mingw-w64-x86-64-posix` (Debian/Ubuntu), `mingw64-gcc-c++` (Fedora), `mingw-w64-gcc` (Arch), `mingw-w64` (Homebrew) |
+| macos | natively on a Mac (universal arm64 + x86_64), or with [osxcross](https://github.com/tpoechtrager/osxcross) on Linux | Xcode command line tools, or osxcross `target/bin` on `PATH` |
+
+Platforms without a toolchain are skipped with a message. `dist/SHA256SUMS`
+lists the checksums of the archives. To publish, attach the files from
+`dist/` to a GitHub release, e.g.
+`gh release create v1.5.0 dist/*.zip dist/SHA256SUMS`. The installers find
+the archive for each OS by its name ending (`-linux-x86_64.zip`,
+`-windows-x64.zip`, `-macos-universal.zip`), so keep the names `build.sh`
+gives them.
+
+## Test tools
+
+`build/mock_host` (Linux/macOS) is a tiny OpenFX host that loads the built
+`.ofx`, runs describe / getFramesNeeded / isIdentity / render over a fake
+clip with a cut and writes raw rgb24 frames. It is what the plugin is tested
+with:
+
+```sh
+ffmpeg -f lavfi -i "smptehdbars=s=640x360:r=30:d=1.2" -pix_fmt rgb24 -f rawvideo from.rgb
+ffmpeg -f lavfi -i "testsrc2=s=1280x720:r=30:d=1.2,crop=640:360:x='100+t*300':y='90+t*60'" \
+       -pix_fmt rgb24 -f rawvideo to.rgb
+./build/mock_host build/Datamosh.ofx.bundle/Contents/Linux-x86-64/Datamosh.ofx \
+    from.rgb to.rgb 640 360 36 out.rgb
+ffmpeg -f rawvideo -pix_fmt rgb24 -s 640x360 -r 30 -i out.rgb out.mp4
+```
+
+Any parameter can be set after the view argument as `name=value`, e.g.
+`... out.rgb 0 recoverMode=4 recoverStart=0.4`. `MOCK_PURGE=1` drops the
+plugin's cache before every frame (like scrubbing), so the output can be
+compared with a normal sequential run; `MOCK_PARAMS=1` prints each
+parameter's group and enabled state and exits. Other switches emulate what
+real hosts do differently: `MOCK_THREADS=n` provides the multithread suite
+with n threads, `MOCK_SCALE=0.5` renders at a render scale (output scaled
+back up), `MOCK_PAD=n` gives source images an n-pixel border beyond the
+output's bounds, `MOCK_OFFSET=n` moves every image's origin to (n, n),
+`MOCK_NO_TEMPORAL=1` reports a host without temporal clip access. The host
+prints the total and average time spent in render.
+
+`build/mosh_test` runs only the algorithm core on two raw clips.
+
+## Layout
+
+```
+src/mosh_core.h          host-independent algorithm (motion search, mosh step, recovery)
+src/datamosh_plugin.cpp  OpenFX glue: describe, params, cut detection, caches, render
+tools/mosh_test.cpp      offline harness for the core
+tools/mock_host.cpp      minimal OpenFX host for end-to-end plugin tests
+packaging/Info.plist     bundle metadata
+install.sh / install.ps1 install a local build or the latest release (SHA-256 checked)
+build.sh                 release archives for Linux, Windows and macOS into dist/
+cmake/                   toolchain files for MinGW-w64 and osxcross cross builds
+```

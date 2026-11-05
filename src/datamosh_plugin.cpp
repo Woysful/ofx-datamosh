@@ -27,7 +27,7 @@
 #define PLUGIN_ID "com.github.ofxdatamosh.Datamosh"
 #define PLUGIN_VERSION_MAJOR 1
 #define PLUGIN_VERSION_MINOR 5
-#define PLUGIN_VERSION_STRING "1.5"
+#define PLUGIN_VERSION_STRING "1.5.0"
 
 static OfxHost* gHost = nullptr;
 static OfxImageEffectSuiteV1* gEffect = nullptr;
@@ -50,7 +50,7 @@ const char* kRepeat = "bloomRepeat";        // int: decode each P-frame N times
 const char* kIntra = "intraThreshold";      // double 0..1
 const char* kSmooth = "smoothVectors";      // bool
 const char* kFillFlat = "fillFlat";         // bool
-const char* kMoshStyle = "moshStyle";       // choice: Natural / Classic
+const char* kMoshStyle = "moshStyle";       // choice: intra + half-pel / P-only, full-pel
 const char* kIntraRate = "intraRate";       // double 0..1: encoder-style intra decision
 const char* kSubpel = "halfPelMotion";      // bool
 const char* kRecoverStart = "recoverStart"; // double 0..1
@@ -72,15 +72,15 @@ const char* kGrpAdvanced = "grpAdvanced";
 }  // namespace P
 
 static const int kDefaultRecovery = (int)mosh::Recovery::Natural;
-static const int kStyleClassic = 1;
+static const int kStylePOnly = 1;
 
 struct StyleDefaults {
     double residual;
     int recovery;
 };
 static const StyleDefaults kStyleDefaults[2] = {
-    {1.0, (int)mosh::Recovery::Natural},        // Natural
-    {0.6, (int)mosh::Recovery::MotionRefresh},  // Classic
+    {1.0, (int)mosh::Recovery::Natural},        // intra + half-pel
+    {0.6, (int)mosh::Recovery::MotionRefresh},  // P-only, full-pel
 };
 
 static const int kBlockSizes[] = {8, 16, 32, 64};
@@ -451,7 +451,7 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.fillFlat = getInt(ps, P::kFillFlat, t, 1) != 0;
     s.intraRate = (float)getDouble(ps, P::kIntraRate, t, 0.6);
     s.subpel = getInt(ps, P::kSubpel, t, 1) != 0;
-    if (getInt(ps, P::kMoshStyle, t, 0) == kStyleClassic) {
+    if (getInt(ps, P::kMoshStyle, t, 0) == kStylePOnly) {
         s.intraRate = 0.f;
         s.subpel = false;
     }
@@ -805,14 +805,14 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
 
     beginGroup(ps, P::kGrpMosh, "Mosh", "How the old picture is dragged and smeared.", true);
     defineChoice(ps, P::kMoshStyle, "Mosh Style",
-                 "Natural (intra decisions, half-pel): the new shot replaces the old picture from the first frame "
-                 "after the cut, the way it does in a real stream with a deleted keyframe: encoder-style intra/inter "
-                 "mode decisions per macroblock and half-pixel motion compensation. "
-                 "Classic (full-pel P-blocks): the old picture is smeared by whole-pixel motion compensation alone "
-                 "until recovery starts, as in earlier versions. "
+                 "Intra + half-pel: the new shot replaces the old picture from the first frame after the cut, "
+                 "the way it does in a real stream with a deleted keyframe: encoder-style intra/inter mode "
+                 "decisions per macroblock and half-pixel motion compensation. "
+                 "P-only, full-pel: the old picture is smeared by whole-pixel motion compensation alone until "
+                 "recovery starts, as in versions before 1.5. "
                  "Switching also moves Residual Strength and Recovery to the style's defaults if they were left "
                  "at the other style's defaults.",
-                 {"Natural (intra decisions, half-pel)", "Classic (full-pel P-blocks)"}, 0);
+                 {"Intra + half-pel (new shot from the cut)", "P-only, full-pel (smear until recovery)"}, 0);
     defineInt(ps, P::kMoshLength, "Mosh Length",
               "How many frames after the cut the mosh lasts (including recovery).", 30, 2, 600);
     defineDouble(ps, P::kResidual, "Residual Strength",
@@ -943,9 +943,9 @@ static void updateEnabled(OfxImageEffectHandle inst) {
                                  mode == mosh::Recovery::Natural || directional);
     setEnabled(ps, P::kRecoverCurve, mode != mosh::Recovery::HardCut);
     setEnabled(ps, P::kRecoverStart, mode != mosh::Recovery::Natural);
-    const bool classic = currentInt(ps, P::kMoshStyle, 0) == kStyleClassic;
-    setEnabled(ps, P::kIntraRate, !classic);
-    setEnabled(ps, P::kSubpel, !classic);
+    const bool pOnly = currentInt(ps, P::kMoshStyle, 0) == kStylePOnly;
+    setEnabled(ps, P::kIntraRate, !pOnly);
+    setEnabled(ps, P::kSubpel, !pOnly);
 }
 
 static double currentDouble(OfxParamSetHandle ps, const char* name, double fallback) {
@@ -964,8 +964,8 @@ static void applyStyleDefaults(OfxImageEffectHandle inst) {
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
     const int style = currentInt(ps, P::kMoshStyle, 0);
-    const StyleDefaults& to = kStyleDefaults[style == kStyleClassic ? 1 : 0];
-    const StyleDefaults& from = kStyleDefaults[style == kStyleClassic ? 0 : 1];
+    const StyleDefaults& to = kStyleDefaults[style == kStylePOnly ? 1 : 0];
+    const StyleDefaults& from = kStyleDefaults[style == kStylePOnly ? 0 : 1];
     OfxParamHandle h = nullptr;
     gParam->paramEditBegin(ps, "Mosh Style");
     if (std::fabs(currentDouble(ps, P::kResidual, from.residual) - from.residual) < 1e-6 &&
