@@ -847,7 +847,7 @@ static void defineClip(OfxImageEffectHandle effect, const char* name, bool tempo
     if (temporal) gProp->propSetInt(cp, kOfxImageEffectPropTemporalClipAccess, 0, 1);
 }
 
-static std::vector<std::string> presetMenu(bool sync);
+static std::vector<std::string> presetMenu();
 
 static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     defineClip(effect, kOfxImageEffectSimpleSourceClipName, true);
@@ -874,9 +874,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                 "Save the current settings under Preset Name. A preset with the same name is replaced.");
     {
         OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kPresetList, "Saved Presets",
-                                             "Presets saved so far. Presets saved in another project or "
-                                             "another host session appear after the host restarts.");
-        const std::vector<std::string> names = presetMenu(true);
+                                             "Presets in the presets file, by name. Hosts that do not update "
+                                             "menus while running show changes after a restart.");
+        const std::vector<std::string> names = presetMenu();
         for (size_t i = 0; i < names.size(); ++i)
             gProp->propSetString(p, kOfxParamPropChoiceOption, (int)i, names[i].c_str());
         gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
@@ -1268,86 +1268,94 @@ static void showMessage(OfxImageEffectHandle inst, const char* type, const std::
     gMessage->message(inst, type, nullptr, fmtText.c_str());
 }
 
-// Saved Presets menu: entry 0 is a prompt, then preset names. During a host
-// session entries are only appended or relabelled, never removed or moved,
-// because a host may keep showing the menu it got when the plugin was
-// described; with append-only changes an index means the same preset in the
-// old and the updated menu. Deleted presets keep their place, marked.
-static std::mutex gPresetMutex;
-static std::vector<std::string> gPresetNames;  // index i + 1 in the menu
-static std::vector<bool> gPresetDeleted;
+// Saved Presets menu: entry 0 is a prompt, then the names in the presets
+// file, sorted. A pick is resolved by the label the host holds at the picked
+// index, not by the index itself, so a menu older than the file (another
+// instance saved or deleted, or a host that keeps the menu it got when the
+// plugin was described) still loads the preset the user saw.
+static std::mutex gPresetMutex;  // serialises read-modify-write of the file
 static const char* kPresetPrompt = "Pick a saved preset";
-static const char* kPresetDeletedSuffix = " (deleted)";
 static const size_t kPresetNameMax = 64;
 
-static std::vector<std::string> presetMenuLocked() {
-    std::vector<std::string> m{kPresetPrompt};
-    for (size_t i = 0; i < gPresetNames.size(); ++i)
-        m.push_back(gPresetDeleted[i] ? gPresetNames[i] + kPresetDeletedSuffix : gPresetNames[i]);
+static std::vector<std::string> presetMenu() {
+    std::vector<std::string> m;
+    {
+        std::lock_guard<std::mutex> g(gPresetMutex);
+        for (const auto& sec : readPresetFile(presetFile(false))) m.push_back(sec.first);
+    }
+    auto lower = [](std::string s) {
+        for (char& ch : s)
+            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        return s;
+    };
+    std::sort(m.begin(), m.end(), [&](const std::string& a, const std::string& b) {
+        const std::string la = lower(a), lb = lower(b);
+        return la != lb ? la < lb : a < b;
+    });
+    m.erase(std::unique(m.begin(), m.end()), m.end());
+    m.insert(m.begin(), kPresetPrompt);
     return m;
 }
 
-// sync: bring the session list in line with the presets file (new names are
-// appended, missing ones marked deleted).
-static std::vector<std::string> presetMenu(bool sync) {
-    std::lock_guard<std::mutex> g(gPresetMutex);
-    if (sync) {
-        std::vector<bool> seen(gPresetNames.size(), false);
-        for (const auto& sec : readPresetFile(presetFile(false))) {
-            size_t i = 0;
-            while (i < gPresetNames.size() && gPresetNames[i] != sec.first) ++i;
-            if (i == gPresetNames.size()) {
-                gPresetNames.push_back(sec.first);
-                gPresetDeleted.push_back(false);
-                seen.push_back(true);
-            } else {
-                seen[i] = true;
-                gPresetDeleted[i] = false;
-            }
-        }
-        for (size_t i = 0; i < seen.size(); ++i)
-            if (!seen[i]) gPresetDeleted[i] = true;
-    }
-    return presetMenuLocked();
-}
-
-// Push the session list into this instance's menu, for hosts that update a
-// choice menu at run time. Returns how many entries the host accepted. Hosts
-// such as Natron append an entry on every write to the option property, so
-// the menu is cleared first and only touched when it differs.
-static int refreshPresetMenu(OfxImageEffectHandle inst) {
+static OfxPropertySetHandle presetListProps(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     OfxParamHandle h = nullptr;
     OfxPropertySetHandle props = nullptr;
-    if (!ps || gParam->paramGetHandle(ps, P::kPresetList, &h, &props) != kOfxStatOK || !props) return 0;
-    const std::vector<std::string> m = presetMenu(false);
-    int cur = 0;
-    if (gProp->propGetDimension(props, kOfxParamPropChoiceOption, &cur) == kOfxStatOK && cur == (int)m.size()) {
-        bool same = true;
-        for (int i = 0; i < cur && same; ++i) {
-            char* s = nullptr;
-            same = gProp->propGetString(props, kOfxParamPropChoiceOption, i, &s) == kOfxStatOK && s && m[(size_t)i] == s;
-        }
-        if (same) return cur;
-    }
-    gProp->propReset(props, kOfxParamPropChoiceOption);
+    if (!ps || gParam->paramGetHandle(ps, P::kPresetList, &h, &props) != kOfxStatOK) return nullptr;
+    return props;
+}
+
+// The menu entries as the host holds them for this instance.
+static std::vector<std::string> hostMenu(OfxPropertySetHandle props) {
+    std::vector<std::string> m;
     int n = 0;
-    while (n < (int)m.size() && gProp->propSetString(props, kOfxParamPropChoiceOption, n, m[(size_t)n].c_str()) == kOfxStatOK)
-        ++n;
-    int dim = 0;
-    if (gProp->propGetDimension(props, kOfxParamPropChoiceOption, &dim) == kOfxStatOK) n = std::min(n, dim);
-    return n;
+    if (!props || gProp->propGetDimension(props, kOfxParamPropChoiceOption, &n) != kOfxStatOK) return m;
+    for (int i = 0; i < n; ++i) {
+        char* s = nullptr;
+        if (gProp->propGetString(props, kOfxParamPropChoiceOption, i, &s) != kOfxStatOK) break;
+        m.push_back(s ? s : "");
+    }
+    return m;
+}
+
+// Bring this instance's menu in line with the presets file, for hosts that
+// update a choice menu at run time; returns the menu the host holds
+// afterwards. Hosts such as Natron append an entry on every write to the
+// option property, so the menu is cleared first and only touched when it
+// differs. Entries a host refuses to drop are blanked.
+static std::vector<std::string> refreshPresetMenu(OfxImageEffectHandle inst) {
+    OfxPropertySetHandle props = presetListProps(inst);
+    if (!props) return {};
+    const std::vector<std::string> m = presetMenu();
+    const std::vector<std::string> cur = hostMenu(props);
+    if (cur == m) return cur;
+    gProp->propReset(props, kOfxParamPropChoiceOption);
+    for (size_t i = 0; i < m.size(); ++i)
+        if (gProp->propSetString(props, kOfxParamPropChoiceOption, (int)i, m[i].c_str()) != kOfxStatOK) break;
+    const std::vector<std::string> now = hostMenu(props);
+    for (size_t i = m.size(); i < now.size(); ++i) gProp->propSetString(props, kOfxParamPropChoiceOption, (int)i, "");
+    return hostMenu(props);
+}
+
+static int menuIndexOf(const std::vector<std::string>& menu, const std::string& name) {
+    for (size_t i = 1; i < menu.size(); ++i)
+        if (menu[i] == name) return (int)i;
+    return -1;
+}
+
+static void setPick(OfxParamSetHandle ps, int idx) {
+    OfxParamHandle h = nullptr;
+    if (gParam->paramGetHandle(ps, P::kPresetList, &h, nullptr) == kOfxStatOK && h) gParam->paramSetValue(h, idx);
 }
 
 // Name of the preset picked in Saved Presets, or "" for the prompt.
-static std::string pickedPreset(OfxParamSetHandle ps) {
+static std::string pickedPreset(OfxImageEffectHandle inst, OfxParamSetHandle ps) {
     const int idx = currentInt(ps, P::kPresetList, 0);
-    std::lock_guard<std::mutex> g(gPresetMutex);
-    if (idx < 1 || idx > (int)gPresetNames.size()) return std::string();
-    return gPresetNames[(size_t)idx - 1];
+    const std::vector<std::string> menu = hostMenu(presetListProps(inst));
+    if (idx < 1 || idx >= (int)menu.size() || menu[(size_t)idx] == kPresetPrompt) return std::string();
+    return menu[(size_t)idx];
 }
-
 static std::string cleanPresetName(const std::string& raw) {
     std::string s;
     for (char ch : raw) s += (ch == '[' || ch == ']' || ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : ch;
@@ -1408,7 +1416,6 @@ static void savePreset(OfxImageEffectHandle inst) {
         showMessage(inst, kOfxMessageError, "Datamosh: no user settings folder found, preset not saved.");
         return;
     }
-    int menuIndex = 0;
     {
         std::lock_guard<std::mutex> g(gPresetMutex);
         PresetFile pf = readPresetFile(path);
@@ -1423,19 +1430,10 @@ static void savePreset(OfxImageEffectHandle inst) {
             showMessage(inst, kOfxMessageError, "Datamosh: could not write " + pathToUtf8(path) + ".");
             return;
         }
-        size_t i = 0;
-        while (i < gPresetNames.size() && gPresetNames[i] != name) ++i;
-        if (i == gPresetNames.size()) {
-            gPresetNames.push_back(name);
-            gPresetDeleted.push_back(false);
-        }
-        gPresetDeleted[i] = false;
-        menuIndex = (int)i + 1;
     }
-    const bool listed = menuIndex < refreshPresetMenu(inst);
-    OfxParamHandle h = nullptr;
-    if (listed && gParam->paramGetHandle(ps, P::kPresetList, &h, nullptr) == kOfxStatOK && h)
-        gParam->paramSetValue(h, menuIndex);
+    const int idx = menuIndexOf(refreshPresetMenu(inst), name);
+    const bool listed = idx > 0;
+    if (listed) setPick(ps, idx);
     setString(ps, P::kPresetName, name);
     showMessage(inst, kOfxMessageMessage,
                 "Datamosh: preset \"" + name + "\" saved." +
@@ -1446,7 +1444,7 @@ static void loadPreset(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
-    const std::string name = pickedPreset(ps);
+    const std::string name = pickedPreset(inst, ps);
     if (name.empty()) {
         showMessage(inst, kOfxMessageMessage, "Datamosh: pick a preset in Saved Presets first.");
         return;
@@ -1456,6 +1454,8 @@ static void loadPreset(OfxImageEffectHandle inst) {
     for (const auto& sec : pf)
         if (sec.first == name) vals = &sec.second;
     if (!vals) {
+        const int idx = menuIndexOf(refreshPresetMenu(inst), name);
+        setPick(ps, idx > 0 ? idx : 0);
         showMessage(inst, kOfxMessageMessage, "Datamosh: preset \"" + name + "\" is not in the presets file any more.");
         return;
     }
@@ -1479,7 +1479,7 @@ static void deletePreset(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
-    const std::string name = pickedPreset(ps);
+    const std::string name = pickedPreset(inst, ps);
     if (name.empty()) {
         showMessage(inst, kOfxMessageMessage, "Datamosh: pick a preset in Saved Presets first.");
         return;
@@ -1496,13 +1496,12 @@ static void deletePreset(OfxImageEffectHandle inst) {
             showMessage(inst, kOfxMessageError, "Datamosh: could not write " + pathToUtf8(path) + ".");
             return;
         }
-        for (size_t i = 0; i < gPresetNames.size(); ++i)
-            if (gPresetNames[i] == name) gPresetDeleted[i] = true;
     }
-    refreshPresetMenu(inst);
-    OfxParamHandle h = nullptr;
-    if (gParam->paramGetHandle(ps, P::kPresetList, &h, nullptr) == kOfxStatOK && h) gParam->paramSetValue(h, 0);
-    showMessage(inst, kOfxMessageMessage, "Datamosh: preset \"" + name + "\" deleted.");
+    const bool listed = menuIndexOf(refreshPresetMenu(inst), name) > 0;
+    setPick(ps, 0);
+    showMessage(inst, kOfxMessageMessage,
+                "Datamosh: preset \"" + name + "\" deleted." +
+                    (listed ? " It leaves the Saved Presets menu after the host restarts." : ""));
 }
 
 // Picking a preset fills in its name, so Save Preset updates it.
@@ -1510,15 +1509,19 @@ static void presetPicked(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
-    const std::string name = pickedPreset(ps);
-    if (!name.empty()) setString(ps, P::kPresetName, name);
+    const std::string name = pickedPreset(inst, ps);
+    if (name.empty()) return;
+    setString(ps, P::kPresetName, name);
+    // The menu may be older than the file; update it and keep the pick on
+    // the same preset.
+    const int idx = menuIndexOf(refreshPresetMenu(inst), name);
+    if (idx > 0 && idx != currentInt(ps, P::kPresetList, 0)) setPick(ps, idx);
 }
 static OfxStatus createInstance(OfxImageEffectHandle inst) {
     OfxPropertySetHandle props = nullptr;
     gEffect->getPropertySet(inst, &props);
     if (props) gProp->propSetPointer(props, kOfxPropInstanceData, 0, new Instance());
     updateEnabled(inst);
-    presetMenu(true);
     refreshPresetMenu(inst);
     return kOfxStatOK;
 }

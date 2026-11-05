@@ -71,7 +71,7 @@ static OfxStatus propGetStringN(OfxPropertySetHandle h, const char* n, int c, ch
 static OfxStatus propGetDoubleN(OfxPropertySetHandle h, const char* n, int c, double* v) { for (int k = 0; k < c; ++k) if (propGetDouble(h, n, k, &v[k]) != kOfxStatOK) return kOfxStatErrUnknown; return kOfxStatOK; }
 static OfxStatus propGetIntN(OfxPropertySetHandle h, const char* n, int c, int* v) { for (int k = 0; k < c; ++k) if (propGetInt(h, n, k, &v[k]) != kOfxStatOK) return kOfxStatErrUnknown; return kOfxStatOK; }
 static OfxStatus propReset(OfxPropertySetHandle h, const char* n) {
-    if (gFixedChoices && !strcmp(n, kOfxParamPropChoiceOption)) return kOfxStatErrUnsupported;
+    if ((gFixedChoices || getenv("MOCK_NO_PROPRESET")) && !strcmp(n, kOfxParamPropChoiceOption)) return kOfxStatErrUnsupported;
     PS(h)->s.erase(n); PS(h)->d.erase(n); PS(h)->i.erase(n); PS(h)->p.erase(n); return kOfxStatOK; }
 static OfxStatus propGetDimension(OfxPropertySetHandle h, const char* n, int* c) {
     PropSet* p = PS(h); *c = 0;
@@ -511,10 +511,18 @@ int main(int argc, char** argv) {
         printf("== load with nothing picked\n");
         P["presetList"]->ival = 0;
         press("presetLoad");
-        printf("== save \"My  look\" again (restores the entry)\n");
+        printf("== save \"My  look\" again\n");
         P["presetName"]->sval = "My  look";
         press("presetSave");
         menu();
+        if (const char* file = getenv("OFX_DATAMOSH_PRESETS")) {
+            printf("== another instance adds \"Aaa\" (sorts first); pick 1 in the old menu, load\n");
+            if (FILE* fp = fopen(file, "a")) { fputs("\n[Aaa]\nresidual = 0.11\n", fp); fclose(fp); }
+            pick(1);
+            menu();
+            press("presetLoad");
+            show("after load");
+        }
         return 0;
     }
     if (getenv("MOCK_PARAMS")) {  // dump parameter layout: group, enabled state

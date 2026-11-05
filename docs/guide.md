@@ -172,11 +172,10 @@ preset, so the plugin has its own. Open the **Presets** group:
 
 * **Save**: type a name in **Preset Name** and press **Save Preset**. Saving
   under a name that already exists replaces that preset.
-* **Load**: pick the preset in **Saved Presets** and press **Load Preset**.
-  This works on any clip, in any project.
+* **Load**: pick the preset in **Saved Presets** (sorted by name) and press
+  **Load Preset**. This works on any clip, in any project.
 * **Delete**: pick the preset in **Saved Presets** and press **Delete
-  Preset**. The entry stays in the menu marked "(deleted)" until the host
-  restarts.
+  Preset**. It is removed from the presets file and from the menu.
 
 Picking a preset in Saved Presets also puts its name into Preset Name, so
 Save Preset then updates the picked preset. There is no limit on the number
@@ -184,10 +183,12 @@ of presets.
 
 A preset holds every setting, including Cut mode and Cut Threshold, except
 Cut Frame and the Cut Markers keyframes (those belong to one clip) and View.
-Some hosts read the Saved Presets menu only once per session. There a newly
-saved preset appears in the menu after the host restarts; the plugin says so
-when you save. Presets saved in another project or another running copy of
-the host appear in the menu after a restart too.
+The menu of an effect that is already applied catches up with presets saved
+or deleted elsewhere (on another clip, in another project) when you open
+it and pick an entry, or when you save or delete a preset there. Some hosts
+read the menu only once per session; there a new or deleted preset shows in
+the menu after the host restarts, and the plugin says so when you save or
+delete.
 
 The presets are kept in `presets.ini` in your user settings folder, which
 you can copy to another machine or edit by hand:

@@ -123,7 +123,8 @@ presets, picks, loads and deletes them, prints the values and the Saved
 Presets menu after each step and exits; point `OFX_DATAMOSH_PRESETS` at a
 scratch file so your own presets stay untouched. `MOCK_FIXED_CHOICES=1`
 emulates a host that keeps the menus it got when the plugin was described
-(new presets then appear only after a restart).
+(new presets then appear only after a restart); `MOCK_NO_PROPRESET=1` a
+host that cannot clear a menu but lets entries be rewritten and added.
 Messages the plugin shows through the message suite are printed as
 `[message ...]`.
 
