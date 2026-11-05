@@ -5,6 +5,8 @@
 * [Parameters](#parameters)
 * [Recovery modes](#recovery-modes)
 * [Mosh styles](#mosh-styles)
+* [Marking cuts with keyframes](#marking-cuts-with-keyframes)
+* [Presets](#presets)
 * [Looks to start from](#looks-to-start-from)
 * [Performance](#performance)
 * [Reading the Diagnostics view](#reading-the-diagnostics-view)
@@ -40,7 +42,10 @@ same thing in software, per frame:
 
 The parameters are split into groups in the inspector. Parameters that do
 nothing with the current settings are greyed out (Cut Frame in Auto mode,
-Dark Areas First outside Luma-keyed refresh, and so on).
+Dark Areas First outside Luma-keyed refresh, and so on). The first two groups
+are closed by default: **How to use** holds a short version of the Resolve
+quick start from the README, **Presets** saves and loads your own settings
+(see [Presets](#presets)).
 
 The menu entries use codec terms. Version 1.4 had only three recovery
 modes, called Block refresh, Dissolve and Hard cut; they are now Random
@@ -51,9 +56,9 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame. |
+| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame; Keyframes uses the keyframes of Cut Here, see [Marking cuts with keyframes](#marking-cuts-with-keyframes). |
 | Cut Frame | 0 | Manual mode: first frame of the new shot, in the clip's own frame numbers (Diagnostics shows `T`). |
-| Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
+| Cut Here | off | Keyframes mode: every keyframe of this parameter is a cut. || Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 
 **Mosh**
 
@@ -138,8 +143,53 @@ When you switch style, Residual Strength and Recovery move to the new
 style's defaults, but only if they were still at the old style's defaults;
 values you changed stay. Every Recovery mode works with both styles.
 
-## Looks to start from
+## Marking cuts with keyframes
 
+Auto finds every hard cut in the clip by itself. When you want to pick the
+cuts yourself (only some of them, or a cut Auto does not see), set **Cut**
+to **Keyframes (Cut Here)** and mark the cuts with keyframes of **Cut Here**:
+
+1. Move the playhead to the first frame of the new shot.
+2. Click the keyframe button next to Cut Here. The value of the checkbox
+   does not matter, only where the keyframes are.
+3. Repeat for every cut you want moshed.
+
+To move a cut, drag its keyframe; to drop a cut, delete its keyframe. Only
+marked cuts are moshed, any others in the clip are left alone. A keyframe
+on the very first frame of the clip is ignored, because there is no old
+picture before it. Diagnostics shows `KEYS n`, the number of keyframes the
+plugin sees.
+
+Some hosts do not tell plugins where keyframes are (Diagnostics then shows
+`KEYS UNKNOWN`). There a cut is the frame where the value of Cut Here
+changes, so toggle the checkbox at each cut instead.
+
+## Presets
+
+DaVinci Resolve has no way to save the settings of an OpenFX effect as a
+preset, so the plugin has its own: open the **Presets** group, pick a
+**Slot** (User 1 to User 4), and press **Save to Slot**. On another clip, in
+any project, pick the slot and press **Load from Slot**.
+
+A preset holds every setting except Cut Detection (that belongs to the clip)
+and View. Saving replaces what the slot held before. The slots are kept in
+`presets.ini` in your user settings folder, which you can copy to another
+machine or edit by hand:
+
+| OS | File |
+|---|---|
+| Windows | `%APPDATA%\ofx-datamosh\presets.ini` |
+| macOS | `~/Library/Application Support/ofx-datamosh/presets.ini` |
+| Linux | `~/.config/ofx-datamosh/presets.ini` (or `$XDG_CONFIG_HOME/ofx-datamosh/`) |
+
+The environment variable `OFX_DATAMOSH_PRESETS` overrides the path.
+
+Without the plugin's slots, Resolve itself can still carry settings over:
+on the Edit page copy the clip, then on the target clip use **Paste
+Attributes** (Alt+V) and tick Plugins; on the Color page save the node as a
+still or PowerGrade.
+
+## Looks to start from
 * Melting smear: Mosh Style P-only, full-pel, Bloom 2-4, Residual 0.4-0.8,
   Motion Scale 1-1.5.
 * Realistic mosh, like a broken stream: the defaults. Raise New Data Rate

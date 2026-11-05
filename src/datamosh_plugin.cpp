@@ -7,17 +7,36 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstddef>
+#include <ctime>
 #include <deque>
+#include <clocale>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
+#include "ofxMessage.h"
 #include "ofxMultiThread.h"
 #include "ofxParam.h"
 #include "ofxProperty.h"
@@ -34,12 +53,14 @@ static OfxImageEffectSuiteV1* gEffect = nullptr;
 static OfxPropertySuiteV1* gProp = nullptr;
 static OfxParameterSuiteV1* gParam = nullptr;
 static OfxMultiThreadSuiteV1* gThread = nullptr;
+static OfxMessageSuiteV1* gMessage = nullptr;  // optional
 
 // ---------------------------------------------------------------- params
 
 namespace P {
-const char* kCutMode = "cutMode";           // choice: auto / manual
+const char* kCutMode = "cutMode";           // choice: auto / manual / keyframes
 const char* kCutFrame = "cutFrame";         // int
+const char* kCutHere = "cutHere";           // bool, keyframes mark cuts
 const char* kCutThreshold = "cutThreshold"; // double
 const char* kMoshLength = "moshLength";     // int frames
 const char* kBlockSize = "blockSize";       // choice: 8/16/32/64
@@ -63,7 +84,12 @@ const char* kMaxSteps = "maxSteps";         // int
 const char* kClamp = "clampLevels";         // bool
 const char* kSeed = "seed";                 // int
 const char* kView = "view";                 // choice: result / motion vectors / diagnostics
+const char* kPresetSlot = "presetSlot";     // choice: User 1..4
+const char* kPresetSave = "presetSave";     // push button
+const char* kPresetLoad = "presetLoad";     // push button
 
+const char* kGrpHelp = "grpHelp";
+const char* kGrpPresets = "grpPresets";
 const char* kGrpCut = "grpCut";
 const char* kGrpMosh = "grpMosh";
 const char* kGrpMotion = "grpMotion";
@@ -73,6 +99,9 @@ const char* kGrpAdvanced = "grpAdvanced";
 
 static const int kDefaultRecovery = (int)mosh::Recovery::Natural;
 static const int kStylePOnly = 1;
+static const int kCutManual = 1;
+static const int kCutKeyframes = 2;
+static const int kPresetSlots = 4;
 
 struct StyleDefaults {
     double residual;
@@ -165,6 +194,17 @@ static void defineChoice(OfxParamSetHandle ps, const char* name, const char* lab
     OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, name, label, hint);
     for (size_t i = 0; i < options.size(); ++i) gProp->propSetString(p, kOfxParamPropChoiceOption, (int)i, options[i]);
     gProp->propSetInt(p, kOfxParamPropDefault, 0, def);
+}
+
+// Read-only line of text. Not saved with the project, so a newer plugin
+// version shows its own text in old projects too.
+static void defineText(OfxParamSetHandle ps, const char* name, const char* label, const char* text) {
+    OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeString, name, label, text);
+    gProp->propSetString(p, kOfxParamPropStringMode, 0, kOfxParamStringIsLabel);
+    gProp->propSetString(p, kOfxParamPropDefault, 0, text);
+    gProp->propSetInt(p, kOfxParamPropAnimates, 0, 0);
+    gProp->propSetInt(p, kOfxParamPropPersistant, 0, 0);
+    gProp->propSetInt(p, kOfxParamPropEvaluateOnChange, 0, 0);
 }
 
 static double getDouble(OfxParamSetHandle ps, const char* name, double t, double fallback) {
@@ -651,6 +691,7 @@ struct Plan {
     std::vector<double> times;  // steps + 1 frames, ascending, times[0] == cutFrame
     float q = 0.f;              // recovery progress
     bool passThrough = true;    // output == source
+    int cutKeys = 0;            // keyframes of Cut Here, -1: host does not report them
 };
 
 static void finishPlan(Plan& pl) {
@@ -670,20 +711,70 @@ static void finishPlan(Plan& pl) {
     }
 }
 
+// Keyframes mode: the most recent keyframe of Cut Here at or before t is the
+// first frame of the new shot. A keyframe on the clip's first frame has no
+// old picture before it and is skipped, so a key set there to start the
+// animation does not count. Hosts that do not report keyframes: the most
+// recent frame where the value of Cut Here changes.
+static void keyframeCut(OfxImageEffectHandle inst, OfxParamSetHandle ps, Plan& pl) {
+    OfxParamHandle h = nullptr;
+    if (!ps || gParam->paramGetHandle(ps, P::kCutHere, &h, nullptr) != kOfxStatOK || !h) return;
+    double first = -1e300;
+    OfxImageClipHandle src = nullptr;
+    OfxPropertySetHandle cp = nullptr;
+    if (gEffect->clipGetHandle(inst, kOfxImageEffectSimpleSourceClipName, &src, &cp) == kOfxStatOK && cp) {
+        double r[2] = {0, 0};
+        if (gProp->propGetDoubleN(cp, kOfxImageEffectPropFrameRange, 2, r) == kOfxStatOK) first = r[0];
+    }
+    const double eps = 1e-6;
+    unsigned int n = 0;
+    if (gParam->paramGetNumKeys && gParam->paramGetKeyTime && gParam->paramGetNumKeys(h, &n) == kOfxStatOK) {
+        pl.cutKeys = (int)n;
+        for (unsigned int i = 0; i < n; ++i) {
+            OfxTime kt = 0;
+            if (gParam->paramGetKeyTime(h, i, &kt) != kOfxStatOK) continue;
+            kt = std::round(kt);
+            if (kt <= first + eps || kt > pl.t + eps) continue;
+            if (!pl.cutKnown || kt > pl.cutFrame) {
+                pl.cutKnown = true;
+                pl.cutFrame = kt;
+            }
+        }
+        return;
+    }
+    pl.cutKeys = -1;
+    int v = 0;
+    gParam->paramGetValueAtTime(h, pl.t, &v);
+    const int L = std::max(1, pl.s.moshLength);
+    for (int k = 0; k < L; ++k) {
+        const double ft = pl.t - k;
+        if (ft - 1.0 < first - eps) break;
+        int pv = v;
+        gParam->paramGetValueAtTime(h, ft - 1.0, &pv);
+        if ((pv != 0) != (v != 0)) {
+            pl.cutKnown = true;
+            pl.cutFrame = ft;
+            return;
+        }
+        v = pv;
+    }
+}
 static Plan makePlan(OfxImageEffectHandle inst, double t) {
     Plan pl;
     pl.t = t;
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     pl.s = readSettings(ps, t);
-    if (pl.s.cutMode == 1) {
+    if (pl.s.cutMode == kCutManual) {
         pl.cutKnown = true;
         pl.cutFrame = pl.s.cutFrame;
         finishPlan(pl);
+    } else if (pl.s.cutMode == kCutKeyframes) {
+        keyframeCut(inst, ps, pl);
+        if (pl.cutKnown) finishPlan(pl);
     }
     return pl;
 }
-
 // Auto cut detection: walk back from t and stop at the most recent pair of
 // consecutive frames that differ a lot. That pair is where the removed
 // keyframe would have been. cur (frame t) and prev (frame t - 1) are used
@@ -732,6 +823,7 @@ static OfxStatus onLoad() {
     gProp = (OfxPropertySuiteV1*)gHost->fetchSuite(gHost->host, kOfxPropertySuite, 1);
     gParam = (OfxParameterSuiteV1*)gHost->fetchSuite(gHost->host, kOfxParameterSuite, 1);
     gThread = (OfxMultiThreadSuiteV1*)gHost->fetchSuite(gHost->host, kOfxMultiThreadSuite, 1);
+    gMessage = (OfxMessageSuiteV1*)gHost->fetchSuite(gHost->host, kOfxMessageSuite, 1);
     if (!gEffect || !gProp || !gParam) return kOfxStatErrMissingHostFeature;
     return kOfxStatOK;
 }
@@ -790,15 +882,46 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(effect, &ps);
 
+    beginGroup(ps, P::kGrpHelp, "How to use",
+               "Short instructions. Full guide: https://github.com/Woysful/ofx-datamosh", false);
+    defineText(ps, "help1", "1.", "Put the two shots next to each other (a cut).");
+    defineText(ps, "help2", "2.", "Select both > right-click > New Compound Clip.");
+    defineText(ps, "help3", "3.", "Apply Datamosh to the compound clip.");
+    defineText(ps, "help4", "4.", "The cut is found by itself; set Mosh Length.");
+    defineText(ps, "help5", "No effect?", "It sees no cut: not on a single shot, not as a transition.");
+    defineText(ps, "help6", "Guide", "github.com/Woysful/ofx-datamosh");
+
+    beginGroup(ps, P::kGrpPresets, "Presets",
+               "Save all settings except Cut Detection and View to one of four slots and load them on any clip, "
+               "in any project. The slots are stored in a file in your user settings folder.",
+               false);
+    {
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeChoice, P::kPresetSlot, "Slot",
+                                             "Which preset slot Save and Load use.");
+        for (int i = 0; i < kPresetSlots; ++i)
+            gProp->propSetString(p, kOfxParamPropChoiceOption, i, ("User " + std::to_string(i + 1)).c_str());
+        gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
+        gProp->propSetInt(p, kOfxParamPropAnimates, 0, 0);
+        gProp->propSetInt(p, kOfxParamPropEvaluateOnChange, 0, 0);
+    }
+    defineParam(ps, kOfxParamTypePushButton, P::kPresetSave, "Save to Slot",
+                "Store the current settings in the selected slot, replacing what was there.");
+    defineParam(ps, kOfxParamTypePushButton, P::kPresetLoad, "Load from Slot",
+                "Set all parameters stored in the selected slot. Cut Detection and View stay as they are.");
     beginGroup(ps, P::kGrpCut, "Cut Detection", "Where the keyframe goes missing.", true);
     defineChoice(ps, P::kCutMode, "Cut",
                  "Where the keyframe goes missing. Auto looks back for the most recent hard cut in the clip; "
-                 "Manual uses the frame below.",
-                 {"Auto (scene-change detection)", "Manual frame"}, 0);
+                 "Manual uses the frame below; Keyframes uses the keyframes of Cut Here.",
+                 {"Auto (scene-change detection)", "Manual frame", "Keyframes (Cut Here)"}, 0);
     defineInt(ps, P::kCutFrame, "Cut Frame",
               "Manual mode: first frame of the new shot, in the clip's own frame numbers (see Diagnostics).",
               0, 0, 1000000);
-    defineDouble(ps, P::kCutThreshold, "Cut Threshold",
+    defineBool(ps, P::kCutHere, "Cut Here",
+               "Keyframes mode: every keyframe of this parameter marks a cut (the first frame of the new shot); "
+               "its value does not matter. Add a keyframe at each cut you want moshed and drag keyframes to "
+               "move cuts. A keyframe on the clip's first frame is ignored. In hosts that do not report "
+               "keyframes to plugins a cut is where the value changes, so toggle it at each cut.",
+               false);    defineDouble(ps, P::kCutThreshold, "Cut Threshold",
                  "Auto mode: how different two consecutive frames must be to count as a cut. "
                  "Diagnostics shows the largest difference seen.",
                  0.12, 0.02, 1.0);
@@ -929,9 +1052,10 @@ static void updateEnabled(OfxImageEffectHandle inst) {
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(inst, &ps);
     if (!ps) return;
-    const bool manual = currentInt(ps, P::kCutMode, 0) == 1;
-    setEnabled(ps, P::kCutFrame, manual);
-    setEnabled(ps, P::kCutThreshold, !manual);
+    const int cutMode = currentInt(ps, P::kCutMode, 0);
+    setEnabled(ps, P::kCutFrame, cutMode == kCutManual);
+    setEnabled(ps, P::kCutHere, cutMode == kCutKeyframes);
+    setEnabled(ps, P::kCutThreshold, cutMode == 0);
     const auto mode = (mosh::Recovery)currentInt(ps, P::kRecoverMode, kDefaultRecovery);
     const bool soft = mode != mosh::Recovery::Dissolve && mode != mosh::Recovery::HardCut &&
                       mode != mosh::Recovery::Natural;
@@ -976,6 +1100,267 @@ static void applyStyleDefaults(OfxImageEffectHandle inst) {
         gParam->paramSetValue(h, to.recovery);
     gParam->paramEditEnd(ps);
 }
+// ---------------------------------------------------------------- presets
+
+// Parameters a preset stores: the look. Cut Detection depends on the clip
+// and View is a debug switch, so neither is part of a preset.
+struct PresetParam {
+    const char* name;
+    bool isDouble;
+};
+static const PresetParam kPresetParams[] = {
+    {P::kMoshStyle, false},   {P::kMoshLength, false},    {P::kResidual, true},     {P::kIntraRate, true},
+    {P::kRepeat, false},      {P::kMotionScale, true},    {P::kClamp, false},       {P::kBlockSize, false},
+    {P::kSearchRange, false}, {P::kSubpel, false},        {P::kIntra, true},        {P::kSmooth, false},
+    {P::kFillFlat, false},    {P::kRecoverMode, false},   {P::kRecoverStart, true}, {P::kRecoverCurve, false},
+    {P::kRecoverSoftness, true}, {P::kRevealInvert, false}, {P::kDirection, false}, {P::kSeed, false},
+    {P::kMaxSteps, false},
+};
+
+#ifdef _WIN32
+typedef std::wstring PathStr;
+static std::string pathToUtf8(const PathStr& p) {
+    if (p.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), (int)p.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)std::max(n, 0), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, p.c_str(), (int)p.size(), &out[0], n, nullptr, nullptr);
+    return out;
+}
+static FILE* openFile(const PathStr& p, const char* mode) {
+    const std::wstring m(mode, mode + strlen(mode));
+    return _wfopen(p.c_str(), m.c_str());
+}
+static bool replaceFile(const PathStr& from, const PathStr& to) {
+    return MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+static void makeDir(const PathStr& p) { _wmkdir(p.c_str()); }
+static void removeFile(const PathStr& p) { _wremove(p.c_str()); }
+#else
+typedef std::string PathStr;
+static std::string pathToUtf8(const PathStr& p) { return p; }
+static FILE* openFile(const PathStr& p, const char* mode) { return fopen(p.c_str(), mode); }
+static bool replaceFile(const PathStr& from, const PathStr& to) { return rename(from.c_str(), to.c_str()) == 0; }
+static void makeDir(const PathStr& p) { mkdir(p.c_str(), 0755); }
+static void removeFile(const PathStr& p) { remove(p.c_str()); }
+#endif
+
+// presets.ini in the user's settings folder (created on first save):
+//   Windows %APPDATA%\ofx-datamosh, macOS ~/Library/Application Support/ofx-datamosh,
+//   elsewhere $XDG_CONFIG_HOME/ofx-datamosh or ~/.config/ofx-datamosh.
+// OFX_DATAMOSH_PRESETS overrides the whole path.
+static PathStr presetFile(bool create) {
+#ifdef _WIN32
+    if (const wchar_t* e = _wgetenv(L"OFX_DATAMOSH_PRESETS")) if (*e) return e;
+    const wchar_t* app = _wgetenv(L"APPDATA");
+    if (!app || !*app) return PathStr();
+    const PathStr dir = PathStr(app) + L"\\ofx-datamosh";
+    if (create) makeDir(dir);
+    return dir + L"\\presets.ini";
+#else
+    if (const char* e = getenv("OFX_DATAMOSH_PRESETS")) if (*e) return e;
+    const char* home = getenv("HOME");
+#ifdef __APPLE__
+    if (!home || !*home) return PathStr();
+    const PathStr base = PathStr(home) + "/Library/Application Support";
+#else
+    const char* xdg = getenv("XDG_CONFIG_HOME");
+    PathStr base;
+    if (xdg && *xdg) base = xdg;
+    else if (home && *home) base = PathStr(home) + "/.config";
+    else return PathStr();
+#endif
+    const PathStr dir = base + "/ofx-datamosh";
+    if (create)
+        for (size_t i = 1; i <= dir.size(); ++i)
+            if (i == dir.size() || dir[i] == '/') makeDir(dir.substr(0, i));
+    return dir + "/presets.ini";
+#endif
+}
+
+typedef std::vector<std::pair<std::string, std::string>> PresetValues;
+typedef std::vector<std::pair<std::string, PresetValues>> PresetFile;  // sections in file order
+
+static std::string trim(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && isspace((unsigned char)s[a])) ++a;
+    while (b > a && isspace((unsigned char)s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
+
+// The file always uses '.' as decimal point, whatever locale the host runs in.
+static char localeDecimalPoint() {
+    const std::lconv* lc = std::localeconv();
+    return lc && lc->decimal_point && lc->decimal_point[0] ? lc->decimal_point[0] : '.';
+}
+
+static bool parseNumber(const std::string& text, double& out) {
+    std::string t = trim(text);
+    const char dp = localeDecimalPoint();
+    for (char& ch : t)
+        if (ch == '.') ch = dp;
+    if (t.empty()) return false;
+    char* end = nullptr;
+    out = strtod(t.c_str(), &end);
+    return end && *end == '\0';
+}
+
+// Shortest form that reads back as the same double.
+static std::string formatNumber(double d) {
+    std::string s;
+    const char dp = localeDecimalPoint();
+    for (int prec = 6; prec <= 17; ++prec) {
+        char buf[64];
+        snprintf(buf, sizeof buf, "%.*g", prec, d);
+        s = buf;
+        for (char& ch : s)
+            if (ch == dp) ch = '.';
+        double r = 0;
+        if (parseNumber(s, r) && r == d) break;
+    }
+    return s;
+}
+
+static PresetFile readPresetFile(const PathStr& path) {
+    PresetFile pf;
+    FILE* fp = path.empty() ? nullptr : openFile(path, "rb");
+    if (!fp) return pf;
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, fp)) > 0) text.append(buf, n);
+    fclose(fp);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) nl = text.size();
+        std::string line = trim(text.substr(pos, nl - pos));
+        pos = nl + 1;
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        if (line[0] == '[' && line.back() == ']') {
+            pf.push_back({trim(line.substr(1, line.size() - 2)), {}});
+        } else if (!pf.empty()) {
+            const size_t eq = line.find('=');
+            if (eq != std::string::npos) pf.back().second.push_back({trim(line.substr(0, eq)), trim(line.substr(eq + 1))});
+        }
+    }
+    return pf;
+}
+
+static bool writePresetFile(const PathStr& path, const PresetFile& pf) {
+    std::string text = "# OFX Datamosh presets. Written by the plugin; one section per slot.\n";
+    for (const auto& sec : pf) {
+        text += "\n[" + sec.first + "]\n";
+        for (const auto& kv : sec.second) text += kv.first + " = " + kv.second + "\n";
+    }
+#ifdef _WIN32
+    const PathStr tmp = path + L".tmp";
+#else
+    const PathStr tmp = path + ".tmp";
+#endif
+    FILE* fp = openFile(tmp, "wb");
+    if (!fp) return false;
+    const bool ok = fwrite(text.data(), 1, text.size(), fp) == text.size();
+    if (fclose(fp) != 0 || !ok || !replaceFile(tmp, path)) {
+        removeFile(tmp);
+        return false;
+    }
+    return true;
+}
+
+// The text goes in as the format itself: some hosts show the format string
+// without expanding arguments.
+static void showMessage(OfxImageEffectHandle inst, const char* type, const std::string& text) {
+    if (!gMessage || !gMessage->message) return;
+    std::string fmtText;
+    for (char ch : text) {
+        fmtText += ch;
+        if (ch == '%') fmtText += '%';
+    }
+    gMessage->message(inst, type, nullptr, fmtText.c_str());
+}
+
+static std::string slotName(OfxParamSetHandle ps) {
+    const int slot = std::min(std::max(currentInt(ps, P::kPresetSlot, 0), 0), kPresetSlots - 1);
+    return "User " + std::to_string(slot + 1);
+}
+
+static void savePreset(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    if (!ps) return;
+    const std::string slot = slotName(ps);
+    PresetValues vals;
+    for (const PresetParam& pp : kPresetParams) {
+        OfxParamHandle h = nullptr;
+        if (gParam->paramGetHandle(ps, pp.name, &h, nullptr) != kOfxStatOK || !h) continue;
+        std::string v;
+        if (pp.isDouble) {
+            double d = 0;
+            if (gParam->paramGetValue(h, &d) != kOfxStatOK) continue;
+            v = formatNumber(d);
+        } else {
+            int i = 0;
+            if (gParam->paramGetValue(h, &i) != kOfxStatOK) continue;
+            v = std::to_string(i);
+        }
+        vals.push_back({pp.name, v});
+    }
+    char stamp[32] = "";
+    const std::time_t now = std::time(nullptr);
+    if (const std::tm* lt = std::localtime(&now)) std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M", lt);
+    vals.insert(vals.begin(), {"saved", std::string(stamp) + ", plugin " PLUGIN_VERSION_STRING});
+
+    const PathStr path = presetFile(true);
+    if (path.empty()) {
+        showMessage(inst, kOfxMessageError, "Datamosh: no user settings folder found, preset not saved.");
+        return;
+    }
+    PresetFile pf = readPresetFile(path);
+    bool replaced = false;
+    for (auto& sec : pf)
+        if (sec.first == slot) {
+            sec.second = vals;
+            replaced = true;
+        }
+    if (!replaced) pf.push_back({slot, vals});
+    std::sort(pf.begin(), pf.end(),
+              [](const std::pair<std::string, PresetValues>& a, const std::pair<std::string, PresetValues>& b) {
+                  return a.first < b.first;
+              });
+    if (!writePresetFile(path, pf))
+        showMessage(inst, kOfxMessageError, "Datamosh: could not write " + pathToUtf8(path) + ".");
+    else
+        showMessage(inst, kOfxMessageMessage, "Datamosh: settings saved to " + slot + ".");
+}
+
+static void loadPreset(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    if (!ps) return;
+    const std::string slot = slotName(ps);
+    const PresetFile pf = readPresetFile(presetFile(false));
+    const PresetValues* vals = nullptr;
+    for (const auto& sec : pf)
+        if (sec.first == slot) vals = &sec.second;
+    if (!vals) {
+        showMessage(inst, kOfxMessageMessage, "Datamosh: " + slot + " is empty. Save settings to it first.");
+        return;
+    }
+    gParam->paramEditBegin(ps, "Load Preset");
+    for (const auto& kv : *vals) {
+        const PresetParam* pp = nullptr;
+        for (const PresetParam& c : kPresetParams)
+            if (kv.first == c.name) pp = &c;
+        OfxParamHandle h = nullptr;
+        if (!pp || gParam->paramGetHandle(ps, pp->name, &h, nullptr) != kOfxStatOK || !h) continue;
+        double d = 0;
+        if (!parseNumber(kv.second, d) || !std::isfinite(d)) continue;
+        if (pp->isDouble) gParam->paramSetValue(h, d);
+        else if (d == std::floor(d) && std::fabs(d) < 1e9) gParam->paramSetValue(h, (int)d);
+    }
+    gParam->paramEditEnd(ps);
+    updateEnabled(inst);
+}
 static OfxStatus createInstance(OfxImageEffectHandle inst) {
     OfxPropertySetHandle props = nullptr;
     gEffect->getPropertySet(inst, &props);
@@ -1002,7 +1387,7 @@ static OfxStatus isIdentity(OfxImageEffectHandle inst, OfxPropertySetHandle inAr
     double t = 0;
     gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
     const Plan pl = makePlan(inst, t);
-    if (pl.s.view != 0 || !pl.cutKnown || !pl.passThrough) return kOfxStatReplyDefault;
+    if (pl.s.view != 0 || (!pl.cutKnown && pl.s.cutMode == 0) || !pl.passThrough) return kOfxStatReplyDefault;
     gProp->propSetString(outArgs, kOfxPropName, 0, kOfxImageEffectSimpleSourceClipName);
     gProp->propSetDouble(outArgs, kOfxPropTime, 0, t);
     return kOfxStatOK;
@@ -1022,7 +1407,7 @@ static OfxStatus getFramesNeeded(OfxImageEffectHandle inst, OfxPropertySetHandle
             ts.push_back(pl.cutFrame - 1.0);
             ts.insert(ts.end(), pl.times.begin(), pl.times.end());
         }
-    } else {
+    } else if (pl.s.cutMode == 0) {
         const int L = std::max(1, pl.s.moshLength);
         for (int k = 1; k <= L + 1; ++k) ts.push_back(t - k);
     }
@@ -1150,7 +1535,9 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
     auto line = [&](const std::string& s) { drawText(img, 2 * sc, y, sc, s); y += lh; };
     line("DATAMOSH " PLUGIN_VERSION_STRING);
     line("T " + fmt("%.1f", pl.t) + "  PROG " + fmt("%.3f", pl.progress) +
-         (pl.cutKnown ? "  CUT " + fmt("%.0f", pl.cutFrame) : "  NO CUT"));
+         (pl.cutKnown ? "  CUT " + fmt("%.0f", pl.cutFrame) : "  NO CUT") +
+         (pl.s.cutMode == kCutKeyframes ? (pl.cutKeys < 0 ? std::string("  KEYS UNKNOWN") : "  KEYS " + fmt("%.0f", pl.cutKeys))
+                                        : std::string()));
     line("SCAN MAX DIFF " + fmt("%.4f", pl.scanMaxDiff) + "  THR " + fmt("%.3f", pl.s.cutThreshold) +
          "  FETCHED " + fmt("%.0f", pl.scanned));
     line("N " + fmt("%.0f", pl.nFrames) + "  STEPS " + fmt("%.0f", pl.steps) + "  DONE " + fmt("%.0f", cr.stepsDone) +
@@ -1206,7 +1593,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         cache->putFrame(t, R, fs.cur);
     }
 
-    if (!pl.cutKnown) detectCut(src, cache, pl, R, fs.cur, fs.prev);
+    if (!pl.cutKnown && pl.s.cutMode == 0) detectCut(src, cache, pl, R, fs.cur, fs.prev);
 
     const Settings& s = pl.s;
 
@@ -1291,16 +1678,21 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
         if (!strcmp(action, kOfxActionDestroyInstance)) return destroyInstance(effect);
         if (!strcmp(action, kOfxActionInstanceChanged) || !strcmp(action, kOfxActionPurgeCaches) ||
             !strcmp(action, kOfxActionSyncPrivateData)) {
-            if (Instance* d = instanceData(effect)) d->clear();
+            char* name = nullptr;
+            char* reason = nullptr;
+            if (inArgs && !strcmp(action, kOfxActionInstanceChanged)) {
+                gProp->propGetString(inArgs, kOfxPropName, 0, &name);
+                gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
+            }
+            const bool noRender = name && (!strcmp(name, P::kPresetSlot) || !strcmp(name, P::kPresetSave) ||
+                                           !strcmp(name, P::kPresetLoad) || !strncmp(name, "help", 4));
+            if (!noRender)
+                if (Instance* d = instanceData(effect)) d->clear();
             if (!strcmp(action, kOfxActionInstanceChanged)) {
-                char* name = nullptr;
-                char* reason = nullptr;
-                if (inArgs) {
-                    gProp->propGetString(inArgs, kOfxPropName, 0, &name);
-                    gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
-                }
                 if (name && reason && !strcmp(name, P::kMoshStyle) && !strcmp(reason, kOfxChangeUserEdited))
                     applyStyleDefaults(effect);
+                if (name && !strcmp(name, P::kPresetSave)) savePreset(effect);
+                if (name && !strcmp(name, P::kPresetLoad)) loadPreset(effect);
                 updateEnabled(effect);
             }
             return kOfxStatOK;

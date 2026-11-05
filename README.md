@@ -55,12 +55,14 @@ does not give OpenFX transitions access to neighbouring frames.
 
 | Setting | What it changes |
 |---|---|
+| Cut | Found automatically. Set it to **Keyframes** to mark the cuts yourself with keyframes of Cut Here, which you can drag. |
 | Mosh Style | **Intra + half-pel**: the new shot comes in from the first frame after the cut, like a real stream. **P-only, full-pel**: the old picture is only smeared until recovery starts. |
 | Mosh Length | How many frames after the cut the mosh lasts. |
 | New Data Rate | How fast fresh blocks of the new shot replace the old picture. |
 | Bloom (P-frame Repeat) | 2-4 gives the melting, over-saturated look. |
 | Block Size | Bigger blocks look chunkier and render faster. |
 | Recovery | How the real picture comes back: like a real encoder (default), or one of ten stylised modes. |
+| Presets | Save your settings to one of four slots and load them on any clip, in any project. |
 
 Every parameter, the recovery modes with pictures, starting points for
 different looks and the Diagnostics view are described in the

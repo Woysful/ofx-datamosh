@@ -7,8 +7,10 @@
 
 #include <chrono>
 #include <cmath>
+#include <clocale>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -19,6 +21,7 @@
 
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
+#include "ofxMessage.h"
 #include "ofxMultiThread.h"
 #include "ofxParam.h"
 #include "ofxProperty.h"
@@ -84,7 +87,9 @@ struct Param {
     double dval = 0;
     int ival = 0;
     bool isTransition = false;
+    std::vector<double> keys;  // MOCK_KEYS: keyframe times; each key toggles an int/bool value
 };
+static bool gNoKeyApi = false;  // MOCK_NO_KEYAPI: host does not report keyframes
 struct ParamSet {
     PropSet props;
     std::map<std::string, std::unique_ptr<Param>> params;
@@ -120,9 +125,23 @@ static OfxStatus paramGetValueAtTime(OfxParamHandle ph, OfxTime t, ...) {
         *out = p->isTransition ? std::min(1.0, std::max(0.0, (t - gT0) / gDur)) : p->dval;
     } else {
         int* out = va_arg(ap, int*);
-        *out = p->ival;
+        int flips = 0;
+        for (double k : p->keys) flips += k <= t + 1e-9;
+        *out = p->ival ^ (flips & 1);
     }
     va_end(ap);
+    return kOfxStatOK;
+}
+static OfxStatus paramGetNumKeys(OfxParamHandle ph, unsigned int* n) {
+    if (gNoKeyApi) return kOfxStatErrUnsupported;
+    *n = (unsigned)reinterpret_cast<Param*>(ph)->keys.size();
+    return kOfxStatOK;
+}
+static OfxStatus paramGetKeyTime(OfxParamHandle ph, unsigned int i, OfxTime* t) {
+    Param* p = reinterpret_cast<Param*>(ph);
+    if (gNoKeyApi) return kOfxStatErrUnsupported;
+    if (i >= p->keys.size()) return kOfxStatErrBadIndex;
+    *t = p->keys[i];
     return kOfxStatOK;
 }
 static OfxStatus paramGetValue(OfxParamHandle ph, ...) {
@@ -148,8 +167,8 @@ static OfxParameterSuiteV1 gParamSuite = {
     (OfxStatus(*)(OfxParamHandle, OfxTime, OfxTime, ...))unsupported,   // integral
     paramSetValue,                                                      // setValue
     (OfxStatus(*)(OfxParamHandle, OfxTime, ...))unsupported,            // setValueAtTime
-    (OfxStatus(*)(OfxParamHandle, unsigned int*))unsupported,
-    (OfxStatus(*)(OfxParamHandle, unsigned int, OfxTime*))unsupported,
+    paramGetNumKeys,
+    paramGetKeyTime,
     (OfxStatus(*)(OfxParamHandle, OfxTime, int, int*))unsupported,
     (OfxStatus(*)(OfxParamHandle, OfxTime))unsupported,
     (OfxStatus(*)(OfxParamHandle))unsupported,
@@ -264,12 +283,24 @@ static OfxMultiThreadSuiteV1 gThreadSuite = {
     mtMultiThread, mtNumCPUs, mtIndex, mtIsSpawned, mtMutexCreate, mtMutexDestroy, mtMutexLock, mtMutexUnLock, mtMutexTryLock,
 };
 
+static OfxStatus mockMessage(void*, const char* type, const char*, const char* format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    printf("[message %s] ", type);
+    vprintf(format, ap);
+    printf("\n");
+    va_end(ap);
+    return kOfxStatOK;
+}
+static OfxMessageSuiteV1 gMessageSuite = {mockMessage};
+
 static PropSet gHostProps;
 static const void* fetchSuite(OfxPropertySetHandle, const char* name, int ver) {
     if (!strcmp(name, kOfxPropertySuite) && ver == 1) return &gPropSuite;
     if (!strcmp(name, kOfxParameterSuite) && ver == 1) return &gParamSuite;
     if (!strcmp(name, kOfxImageEffectSuite) && ver == 1) return &gEffectSuite;
     if (!strcmp(name, kOfxMultiThreadSuite) && ver == 1 && gThreads > 0) return &gThreadSuite;
+    if (!strcmp(name, kOfxMessageSuite) && ver == 1) return &gMessageSuite;
     return nullptr;  // without MOCK_THREADS the plugin must fall back to serial
 }
 
@@ -328,6 +359,8 @@ int main(int argc, char** argv) {
     if (const char* e = getenv("MOCK_SCALE")) gScale = atof(e);
     if (const char* e = getenv("MOCK_PAD")) gPad = atoi(e);
     if (const char* e = getenv("MOCK_OFFSET")) gOffX = gOffY = atoi(e);
+    gNoKeyApi = getenv("MOCK_NO_KEYAPI") != nullptr;
+    if (const char* e = getenv("MOCK_LOCALE")) if (!setlocale(LC_ALL, e)) fprintf(stderr, "locale %s not available\n", e);
     gHostProps.s[kOfxPropName] = {"mock.host"};
     gHostProps.i[kOfxImageEffectPropTemporalClipAccess] = {getenv("MOCK_NO_TEMPORAL") ? 0 : 1};
     OfxHost host{H(&gHostProps), fetchSuite};
@@ -370,6 +403,18 @@ int main(int argc, char** argv) {
         else it->second->ival = atoi(eq + 1);
     }
 
+    if (const char* e = getenv("MOCK_KEYS")) {  // name=t1,t2,...
+        const char* eq = strchr(e, '=');
+        auto it = eq ? inst.params.params.find(std::string(e, eq - e)) : inst.params.params.end();
+        if (it == inst.params.params.end()) { fprintf(stderr, "bad MOCK_KEYS: %s\n", e); return 1; }
+        for (const char* q = eq + 1; *q;) {
+            char* end = nullptr;
+            it->second->keys.push_back(strtod(q, &end));
+            if (end == q) break;
+            q = *end == ',' ? end + 1 : end;
+        }
+    }
+
     Clip* out = inst.clips[kOfxImageEffectOutputClipName].get();
     Clip *from = nullptr, *to = nullptr, *source = nullptr;
     Clip fromData, toData;
@@ -394,6 +439,35 @@ int main(int argc, char** argv) {
         c->props.s[kOfxImageEffectPropPixelDepth] = {kOfxBitDepthFloat};
     }
     CHECK(pl->mainEntry(kOfxActionCreateInstance, &inst, nullptr, nullptr), "createInstance");
+    if (getenv("MOCK_PRESETS")) {  // save to a slot, change, load back (OFX_DATAMOSH_PRESETS: file)
+        auto& P = inst.params.params;
+        auto press = [&](const char* name) {
+            PropSet ic;
+            ic.s[kOfxPropName] = {name};
+            ic.s[kOfxPropChangeReason] = {kOfxChangeUserEdited};
+            const OfxStatus st = pl->mainEntry(kOfxActionInstanceChanged, &inst, H(&ic), nullptr);
+            if (st != kOfxStatOK) printf("instanceChanged(%s) failed: %d\n", name, st);
+        };
+        auto show = [&](const char* what) {
+            printf("%s: residual=%.3f recoverMode=%d blockSize=%d seed=%d moshStyle=%d cutMode=%d cutFrame=%d view=%d intraRate.enabled=%d\n",
+                   what, P["residual"]->dval, P["recoverMode"]->ival, P["blockSize"]->ival, P["seed"]->ival,
+                   P["moshStyle"]->ival, P["cutMode"]->ival, P["cutFrame"]->ival, P["view"]->ival,
+                   P["intraRate"]->props.i[kOfxParamPropEnabled][0]);
+        };
+        P["residual"]->dval = 0.3; P["recoverMode"]->ival = 4; P["blockSize"]->ival = 2; P["seed"]->ival = 7;
+        P["moshStyle"]->ival = 1; P["cutMode"]->ival = 1; P["cutFrame"]->ival = 1010; P["presetSlot"]->ival = 1;
+        show("before save (slot 2)");
+        press("presetSave");
+        P["residual"]->dval = 0.9; P["recoverMode"]->ival = 0; P["blockSize"]->ival = 1; P["seed"]->ival = 0;
+        P["moshStyle"]->ival = 0; P["cutMode"]->ival = 0; P["cutFrame"]->ival = 0; P["view"]->ival = 2;
+        show("changed");
+        press("presetLoad");
+        show("after load (slot 2)");
+        P["presetSlot"]->ival = 3;
+        press("presetLoad");
+        show("after load of empty slot 4");
+        return 0;
+    }
     if (getenv("MOCK_PARAMS")) {  // dump parameter layout: group, enabled state
         auto dump = [&]() {
             for (auto& kv : inst.params.params) {
