@@ -24,17 +24,21 @@ enum class Preference { Auto = 0, Cpu = 1, Cuda = 2, OpenCL = 3 };
 struct Engine;
 class Session;
 
-// A session on the GPU the preference asks for, waiting while another render
-// uses it; nullptr when the work stays on the CPU, with the reason in why
-// (empty for Preference::Cpu).
+// A session on the GPU the preference asks for; nullptr when the work stays
+// on the CPU, with the reason in why (empty for Preference::Cpu). Never
+// waits for other renders.
 std::unique_ptr<Session> begin(Preference p, std::string& why);
 
-// Exclusive use of the GPU for one render. Every call returns false on a GPU
-// error; the render then starts over on the CPU, and the session drops the
-// device memory when it ends.
+struct Work;
+
+// One render's use of the GPU. Each call holds the GPU only while it runs,
+// never between calls, so a render can fetch frames from the host without
+// keeping other renders (or the host's own threads) off the GPU. Every call
+// returns false on a GPU error; the render then starts over on the CPU, and
+// the session drops the device memory when it ends.
 class Session {
 public:
-    explicit Session(Engine& e);
+    Session(Engine& e, uint64_t generation);
     ~Session();
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
@@ -43,8 +47,9 @@ public:
     const std::string& error() const { return error_; }
     bool failed() const { return failed_; }
 
-    // The accumulated picture: set from the CPU, restored from / stored in
-    // the device cache (store moves it there), or downloaded.
+    // The accumulated picture, private to the session: set from the CPU,
+    // restored from / stored in the device cache (store moves it there), or
+    // downloaded.
     bool setAcc(const mosh::Image& img);
     bool restoreAcc(const void* owner, double t, double cut, uint64_t hash, std::vector<uint8_t>& refreshed);
     // Time of the newest cached picture of the chain a whole number of
@@ -66,16 +71,16 @@ public:
     bool compose(const FramePtr& to, const mosh::ComposeParams& cp, float q, mosh::Image& out);
 
 private:
-    friend std::unique_ptr<Session> begin(Preference p, std::string& why);
     bool fail(const std::string& what);
     bool ok(bool r);
+    bool live();  // with the engine locked: the device is still the one the session started on
 
     Engine& e_;
-    std::unique_lock<std::mutex> lock_;
+    const uint64_t gen_;
+    std::unique_ptr<Work> w_;
     bool failed_ = false;
     std::string error_;
 };
-
 // Drops the cached pictures of one effect instance (owner as given to storeAcc).
 void forget(const void* owner);
 

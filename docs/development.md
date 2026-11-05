@@ -135,12 +135,24 @@ render time and the number of source frames fetched for every frame, and
 decodes or renders the input on demand. `MOCK_ORDER=i,j,...` renders the
 listed frames (0-based) in that order, like jumping around a timeline; each
 frame's output still goes to its own place in the output file.
+`MOCK_SCRUB=n` makes n renders of random frames (some in short runs) on
+`MOCK_CONCURRENT` threads (default 4), like clicking around a timeline:
+about a third are aborted by the host part-way, and another thread keeps
+purging the plugin's caches while holding a host lock that frame fetches
+and parameter reads also take, as a host's UI thread may. Frames rendered
+to the end go to their places in the output file (`<out>.mask` marks
+them), a frame rendered twice with different results fails the run, and
+the run stops with `HANG` (exit 3) when no render finishes for 30 s. The
+plugin must never call the host while holding a lock that another of its
+threads, or the host's UI thread, can wait for.
 
 Setting `OFX_DATAMOSH_LOG` to a file path before starting a host makes the
-plugin append one line per render: the thread, the time spent and the time
-waited for an earlier frame, the frame the chain continued from (`cut` for
-a full rebuild, `n ckpt` for a checkpoint), the steps run, the source frames fetched and the device.
-That shows how a host schedules renders.
+plugin append a `start` line when a render begins and one line when it
+ends: the thread, the time spent and the time waited for an earlier frame,
+the frame the chain continued from (`cut` for a full rebuild, `n ckpt`
+for a checkpoint), the steps run, the source frames fetched, `aborted` if
+the host stopped it, and the device. That shows how a host schedules
+renders, and a render that never ends has a `start` line without an end.
 
 `build/mosh_test` runs only the algorithm core on two raw clips.
 `MOCK_FLOAT=1` makes `mock_host` write the raw float RGBA output instead of

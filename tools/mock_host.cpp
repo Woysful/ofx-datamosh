@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,10 @@ static OfxStatus propGetPointer(OfxPropertySetHandle h, const char* n, int idx, 
     auto it = PS(h)->p.find(n); if (it == PS(h)->p.end() || idx >= (int)it->second.size()) { fprintf(stderr, "  [host] missing pointer prop %s\n", n); return kOfxStatErrUnknown; }
     *v = it->second[idx]; return kOfxStatOK; }
 static std::mutex gHostMutex;  // MOCK_CONCURRENT: guards what renders share in the host
+// MOCK_SCRUB: a host lock the UI thread holds while it calls the plugin, and
+// that frame fetches and parameter reads take too.
+static std::mutex gUiMutex;
+static bool gScrub = false;
 static OfxStatus propGetString(OfxPropertySetHandle h, const char* n, int idx, char** v) {
     auto it = PS(h)->s.find(n); if (it == PS(h)->s.end() || idx >= (int)it->second.size()) { fprintf(stderr, "  [host] missing string prop %s\n", n); return kOfxStatErrUnknown; }
     std::lock_guard<std::mutex> g(gHostMutex);
@@ -127,6 +132,7 @@ static OfxStatus paramGetHandle(OfxParamSetHandle ps, const char* name, OfxParam
 static OfxStatus paramSetGetPropertySet(OfxParamSetHandle ps, OfxPropertySetHandle* props) { *props = H(&reinterpret_cast<ParamSet*>(ps)->props); return kOfxStatOK; }
 static OfxStatus paramGetPropertySet(OfxParamHandle p, OfxPropertySetHandle* props) { *props = H(&reinterpret_cast<Param*>(p)->props); return kOfxStatOK; }
 static OfxStatus paramGetValueAtTime(OfxParamHandle ph, OfxTime t, ...) {
+    if (gScrub) std::lock_guard<std::mutex> ui(gUiMutex);
     Param* p = reinterpret_cast<Param*>(ph);
     va_list ap; va_start(ap, t);
     if (p->type == kOfxParamTypeDouble) {
@@ -235,6 +241,7 @@ static thread_local int tlFetches;          // source frames fetched by this thr
 static OfxStatus clipGetImage(OfxImageClipHandle ch, OfxTime t, const OfxRectD*, OfxPropertySetHandle* out) {
     Clip* c = reinterpret_cast<Clip*>(ch);
     const bool isOut = c->name == kOfxImageEffectOutputClipName;
+    if (gScrub) std::lock_guard<std::mutex> ui(gUiMutex);
     if (!isOut) {
         ++tlFetches;
         if (gFetchMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(gFetchMs));
@@ -286,7 +293,14 @@ static OfxStatus clipReleaseImage(OfxPropertySetHandle img) {
     return kOfxStatOK;
 }
 static OfxStatus clipGetRoD(OfxImageClipHandle ch, OfxTime, OfxRectD* r) { Clip* c = reinterpret_cast<Clip*>(ch); *r = {0, 0, (double)c->w, (double)c->h}; return kOfxStatOK; }
-static int abortFn(OfxImageEffectHandle) { return 0; }
+// MOCK_SCRUB: the host aborts a render once its deadline passes.
+static thread_local std::chrono::steady_clock::time_point tlAbortAt = std::chrono::steady_clock::time_point::max();
+static thread_local bool tlAborted = false;
+static int abortFn(OfxImageEffectHandle) {
+    if (std::chrono::steady_clock::now() < tlAbortAt) return 0;
+    tlAborted = true;
+    return 1;
+}
 static OfxStatus memAlloc(OfxImageEffectHandle, size_t n, OfxImageMemoryHandle* h) { *h = reinterpret_cast<OfxImageMemoryHandle>(malloc(n)); return kOfxStatOK; }
 static OfxStatus memFree(OfxImageMemoryHandle h) { free(h); return kOfxStatOK; }
 static OfxStatus memLock(OfxImageMemoryHandle h, void** p) { *p = h; return kOfxStatOK; }
@@ -595,7 +609,117 @@ int main(int argc, char** argv) {
     int renders = 0;
     const bool times = getenv("MOCK_TIMES") != nullptr;  // per-frame render time and source fetches
     const int concurrent = getenv("MOCK_CONCURRENT") ? atoi(getenv("MOCK_CONCURRENT")) : 0;
-    if (concurrent > 0) {
+    if (const char* sc = getenv("MOCK_SCRUB")) {
+        // Like a user clicking around the timeline: renders of random frames
+        // (some in short runs) on n threads, some aborted by the host part-way,
+        // while a UI thread purges the plugin's caches holding a host lock that
+        // frame fetches and parameter reads also take. Each frame rendered
+        // to the end goes to its slot (out.rgb.mask marks them); a frame
+        // rendered twice with different results counts as a mismatch.
+        const int renderCount = atoi(sc);
+        const int nth = concurrent > 0 ? concurrent : 4;
+        const size_t frameBytes = (size_t)w * h * 4 * sizeof(float);
+        std::atomic<int> started{0}, finished{0}, abortedN{0}, mismatched{0};
+        std::atomic<bool> failed{false}, done{false};
+        std::mutex outM;
+        std::vector<uint64_t> sums((size_t)total, 0);
+        gScrub = true;
+        const auto wall0 = std::chrono::steady_clock::now();
+        auto worker = [&](int k) {
+            std::mt19937 rng(1234u + 7919u * (unsigned)k);
+            int last = (int)(rng() % (unsigned)total), run = 0;
+            for (int r; (r = started++) < renderCount && !failed;) {
+                int i;
+                if (run > 0) { i = (last + 1) % total; --run; }
+                else { i = (int)(rng() % (unsigned)total); if (rng() % 2) run = (int)(rng() % 6); }
+                last = i;
+                const double t = gT0 + i;
+                PropSet inArgs, outArgs, idOut;
+                inArgs.d[kOfxPropTime] = {t};
+                inArgs.i[kOfxImageEffectPropRenderWindow] = {gOffX, gOffY, gOffX + w, gOffY + h};
+                inArgs.d[kOfxImageEffectPropRenderScale] = {1.0, 1.0};
+                inArgs.i[kOfxPropIsInteractive] = {1};
+                pl->mainEntry(kOfxImageEffectActionGetFramesNeeded, &inst, H(&inArgs), H(&outArgs));
+                tlOutImage = nullptr;
+                tlAborted = false;
+                tlAbortAt = rng() % 3 == 0 ? std::chrono::steady_clock::now() + std::chrono::milliseconds(rng() % 40)
+                                           : std::chrono::steady_clock::time_point::max();
+                if (pl->mainEntry(kOfxImageEffectActionIsIdentity, &inst, H(&inArgs), H(&idOut)) == kOfxStatOK) {
+                    ++finished;
+                    continue;
+                }
+                if (pl->mainEntry(kOfxImageEffectActionRender, &inst, H(&inArgs), nullptr) != kOfxStatOK || !tlOutImage) {
+                    fprintf(stderr, "render %d (frame %d) failed\n", r, i);
+                    failed = true;
+                    return;
+                }
+                if (tlAborted) {
+                    ++abortedN;
+                } else {
+                    uint64_t hs = 1469598103934665603ull;
+                    const unsigned char* b = reinterpret_cast<const unsigned char*>(tlOutImage->data.data());
+                    for (size_t q = 0; q < frameBytes; ++q) { hs ^= b[q]; hs *= 1099511628211ull; }
+                    std::lock_guard<std::mutex> g(outM);
+                    if (!sums[(size_t)i]) {
+                        sums[(size_t)i] = hs;
+                        fseek(fo, (long)(frameBytes * (size_t)i), SEEK_SET);
+                        fwrite(tlOutImage->data.data(), 1, frameBytes, fo);
+                    } else if (sums[(size_t)i] != hs) {
+                        ++mismatched;
+                        fprintf(stderr, "frame %d rendered differently\n", i);
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> g(gHostMutex);
+                    for (size_t q = 0; q < out->live.size(); ++q)
+                        if (out->live[q].get() == tlOutImage) { out->live.erase(out->live.begin() + (long)q); break; }
+                }
+                ++finished;
+            }
+        };
+        std::thread ui([&]() {
+            std::mt19937 rng(99);
+            while (!done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2 + rng() % 14));
+                std::lock_guard<std::mutex> g(gUiMutex);
+                pl->mainEntry(kOfxActionPurgeCaches, &inst, nullptr, nullptr);
+            }
+        });
+        std::thread watchdog([&]() {
+            int seen = -1;
+            auto since = std::chrono::steady_clock::now();
+            while (!done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                const int f = finished;
+                if (f != seen) { seen = f; since = std::chrono::steady_clock::now(); continue; }
+                if (std::chrono::steady_clock::now() - since > std::chrono::seconds(30)) {
+                    printf("HANG: no render finished for 30 s (%d of %d done)\n", f, renderCount);
+                    fflush(stdout);
+                    std::_Exit(3);
+                }
+            }
+        });
+        std::vector<std::thread> th;
+        for (int k = 0; k < nth; ++k) th.emplace_back(worker, k);
+        for (auto& x : th) x.join();
+        done = true;
+        ui.join();
+        watchdog.join();
+        fclose(fo);
+        const std::string maskPath = std::string(argv[7]) + ".mask";
+        if (FILE* fm = fopen(maskPath.c_str(), "wb")) {
+            for (uint64_t v : sums) fputc(v ? 1 : 0, fm);
+            fclose(fm);
+        }
+        const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
+        printf("scrub: %d renders, %d aborted, %d mismatched, wall %.0f ms\n", (int)finished, (int)abortedN,
+               (int)mismatched, wall);
+        if (failed || mismatched) return 1;
+        CHECK(pl->mainEntry(kOfxActionDestroyInstance, &inst, nullptr, nullptr), "destroy");
+        CHECK(pl->mainEntry(kOfxActionUnload, nullptr, nullptr, nullptr), "unload");
+        printf("done\n");
+        return 0;
+    }    if (concurrent > 0) {
         // Like a host playing back: n renders in flight, started in frame
         // order, finishing in any order. Output is written at each frame's slot.
         const size_t frameBytes = getenv("MOCK_FLOAT") ? (size_t)w * h * 4 * sizeof(float) : rgbOut.size();

@@ -40,28 +40,33 @@ const size_t kMaxFrames = 3;   // a step needs two; one more keeps the next rend
 const size_t kMaxAccs = 2;
 const size_t kMaxPool = 6;
 const int kMaxFailures = 3;    // consecutive failed renders before the GPU is given up
+const int kMaxSessions = 3;    // renders on the GPU at once; more stay on the CPU
 
 }  // namespace
+
+struct Work {
+    Buffer acc, accTmp;  // the accumulated picture and its ping-pong partner
+    int accW = 0, accH = 0;
+};
 
 struct Engine {
     std::mutex m;
     std::unique_ptr<gpu::Device> dev;
+    uint64_t gen = 0;  // changes whenever dev is closed
     bool devAnyType = false;
     std::string triedCuda, triedCl, triedClAny;  // failure reasons, "" = not tried or worked
     bool cudaTried = false, clTried = false, clAnyTried = false;
     std::string broken;  // set once the GPU has been given up
+    bool closeWhenIdle = false;  // given up while sessions were still open
     int failures = 0;
+    int sessions = 0;
     uint64_t clock = 0;
 
     std::vector<std::unique_ptr<DevFrame>> frames;
     std::vector<DevAcc> accs;
     std::vector<Buffer> pool;  // free full-frame buffers
-    // Block-level scratch, grown as needed.
+    // Block-level scratch, grown as needed; only valid inside one locked call.
     Buffer dx, dy, err, flat, rowCost, rowM, rowVx, refine, table, flags, sums, counts, band, start, sign, sample;
-    // The session's accumulated picture and its ping-pong partner.
-    Buffer acc, accTmp;
-    int accW = 0, accH = 0;
-
     void free(Buffer& b) {
         if (b && dev) dev->release(b);
         b = Buffer();
@@ -97,19 +102,18 @@ struct Engine {
         frames.clear();
         for (DevAcc& a : accs) put(a.buf);
         accs.clear();
-        put(acc);
-        put(accTmp);
         for (Buffer& b : pool) free(b);
         pool.clear();
         for (Buffer* b : {&dx, &dy, &err, &flat, &rowCost, &rowM, &rowVx, &refine, &table, &flags, &sums, &counts,
                           &band, &start, &sign, &sample})
             free(*b);
     }
+    // Only with no session open: sessions keep buffers of the device.
     void close() {
         purge();
         dev.reset();
+        ++gen;
     }
-
     // The device copy of img, uploaded on first use.
     DevFrame* frame(const FramePtr& img) {
         for (size_t i = 0; i < frames.size();) {
@@ -180,25 +184,45 @@ static Engine& engine() {
 
 // ---------------------------------------------------------------- session
 
-Session::Session(Engine& e) : e_(e), lock_(e.m, std::defer_lock) {}
+// Every call below locks the engine for its own duration only.
+#define LOCKED()                              \
+    std::lock_guard<std::mutex> locked_(e_.m); \
+    if (!live()) return false
+
+Session::Session(Engine& e, uint64_t generation) : e_(e), gen_(generation), w_(new Work) {}
 
 Session::~Session() {
-    if (!lock_.owns_lock()) return;
     Engine& e = e_;
-    if (failed_) {
-        e.purge();
-        if (++e.failures >= kMaxFailures) {
-            e.broken = "GPU off after errors: " + error_;
-            e.close();
+    std::lock_guard<std::mutex> g(e.m);
+    if (e.gen == gen_ && e.dev) {
+        if (failed_) {
+            e.free(w_->acc);
+            e.free(w_->accTmp);
+            e.purge();
+            if (++e.failures >= kMaxFailures && e.broken.empty()) {
+                e.broken = "GPU off after errors: " + error_;
+                e.closeWhenIdle = true;
+            }
+        } else {
+            e.failures = 0;
+            e.put(w_->acc);
+            e.put(w_->accTmp);
         }
-    } else {
-        e.failures = 0;
-        e.put(e.acc);
-        e.put(e.accTmp);
+    }
+    if (--e.sessions == 0 && e.closeWhenIdle) {
+        e.closeWhenIdle = false;
+        e.close();
     }
 }
 
+bool Session::live() {
+    if (failed_) return false;
+    if (e_.gen != gen_ || !e_.dev) return fail("GPU closed");
+    return true;
+}
+
 std::string Session::label() const {
+    std::lock_guard<std::mutex> g(e_.m);
     if (!e_.dev) return std::string();
     return std::string(e_.dev->api() == gpu::Api::Cuda ? "CUDA " : "OPENCL ") + e_.dev->name();
 }
@@ -218,27 +242,29 @@ bool Session::ok(bool r) {
 }
 
 bool Session::setAcc(const mosh::Image& img) {
-    if (failed_) return false;
+    LOCKED();
     Engine& e = e_;
+    Work& w = *w_;
     const size_t bytes = img.px.size() * sizeof(float);
-    if (e.acc && e.acc.bytes != bytes) e.put(e.acc);
-    if (!e.acc && !ok(e.get(e.acc, bytes))) return false;
-    e.accW = img.w;
-    e.accH = img.h;
-    return ok(e.dev->upload(e.acc, img.px.data(), bytes));
+    if (w.acc && w.acc.bytes != bytes) e.put(w.acc);
+    if (!w.acc && !ok(e.get(w.acc, bytes))) return false;
+    w.accW = img.w;
+    w.accH = img.h;
+    return ok(e.dev->upload(w.acc, img.px.data(), bytes));
 }
 
 bool Session::restoreAcc(const void* owner, double t, double cut, uint64_t hash, std::vector<uint8_t>& refreshed) {
-    if (failed_) return false;
+    LOCKED();
     Engine& e = e_;
+    Work& w = *w_;
     for (size_t i = 0; i < e.accs.size(); ++i) {
         DevAcc& a = e.accs[i];
         if (a.owner != owner || a.t != t || a.cut != cut || a.hash != hash) continue;
         // The cache entry becomes the working picture; the next store puts it back.
-        e.put(e.acc);
-        e.acc = a.buf;
-        e.accW = a.w;
-        e.accH = a.h;
+        e.put(w.acc);
+        w.acc = a.buf;
+        w.accW = a.w;
+        w.accH = a.h;
         refreshed = a.refreshed;
         e.accs.erase(e.accs.begin() + (long)i);
         return true;
@@ -248,7 +274,8 @@ bool Session::restoreAcc(const void* owner, double t, double cut, uint64_t hash,
 
 double Session::latestAcc(const void* owner, double t, double cut, uint64_t hash) const {
     double best = -HUGE_VAL;
-    if (failed_) return best;
+    std::lock_guard<std::mutex> g(e_.m);
+    if (failed_ || e_.gen != gen_) return best;
     for (const DevAcc& a : e_.accs) {
         const double d = t - a.t;
         if (a.owner == owner && a.cut == cut && a.hash == hash && a.t >= cut && d > 0.5 &&
@@ -259,8 +286,10 @@ double Session::latestAcc(const void* owner, double t, double cut, uint64_t hash
 }
 
 bool Session::storeAcc(const void* owner, double t, double cut, uint64_t hash, const std::vector<uint8_t>& refreshed) {
-    if (failed_ || !e_.acc) return false;
+    LOCKED();
     Engine& e = e_;
+    Work& w = *w_;
+    if (!w.acc) return false;
     for (size_t i = 0; i < e.accs.size(); ++i)
         if (e.accs[i].owner == owner && e.accs[i].t == t && e.accs[i].cut == cut && e.accs[i].hash == hash) {
             e.put(e.accs[i].buf);
@@ -288,82 +317,100 @@ bool Session::storeAcc(const void* owner, double t, double cut, uint64_t hash, c
     a.t = t;
     a.cut = cut;
     a.hash = hash;
-    a.w = e.accW;
-    a.h = e.accH;
-    a.buf = e.acc;
+    a.w = w.accW;
+    a.h = w.accH;
+    a.buf = w.acc;
     a.refreshed = refreshed;
     a.used = ++e.clock;
-    e.acc = Buffer();
+    w.acc = Buffer();
     e.accs.push_back(std::move(a));
     return true;
 }
 
 bool Session::downloadAcc(mosh::Image& out) {
-    if (failed_ || !e_.acc) return fail("no picture");
-    out.resize(e_.accW, e_.accH);
-    return ok(e_.dev->download(e_.acc, out.px.data(), out.px.size() * sizeof(float)));
+    LOCKED();
+    Work& w = *w_;
+    if (!w.acc) return fail("no picture");
+    out.resize(w.accW, w.accH);
+    return ok(e_.dev->download(w.acc, out.px.data(), out.px.size() * sizeof(float)));
 }
 
 bool Session::estimateMotion(const FramePtr& prev, const FramePtr& cur, const mosh::MotionParams& mp,
                              mosh::MotionField& mf, const mosh::ParallelFor& pf) {
-    if (failed_) return false;
-    Engine& e = e_;
-    gpu::Device& d = *e.dev;
-    DevFrame* P = e.frame(prev);
-    if (!ok(P != nullptr)) return false;
-    DevFrame* C = e.frame(cur);
-    if (!ok(C != nullptr)) return false;
-    P = e.frame(prev);  // still cached: the cache holds more frames than a step uses
-    if (!P || P->w != C->w || P->h != C->h) return fail("frame sizes differ");
-    const int w = C->w, h = C->h;
-
-    mf = mosh::newField(w, h, mp);
-    const int levels = mosh::pyramidLevels(w, h);
-    if (!ok(e.pyramid(*P, levels)) || !ok(e.pyramid(*C, levels))) return false;
-    const int nb = mf.bw * mf.bh;
-    const size_t nbI = (size_t)nb * sizeof(int);
-    if (!ok(e.ensure(e.dx, nbI)) || !ok(e.ensure(e.dy, nbI)) || !ok(e.ensure(e.err, nbI))) return false;
-    if (!ok(d.upload(e.dx, mf.dx.data(), nbI)) || !ok(d.upload(e.dy, mf.dy.data(), nbI))) return false;
-
-    for (int lvl = levels - 1; lvl >= 0; --lvl) {
-        const int dd = 1 << lvl;
-        const int ws = mosh::searchWindow(mf, lvl);
-        const int r = mosh::searchRadius(mp, lvl, levels);
-        const float norm = 1.f / float(ws * ws);
-        const int rows = 2 * r + 1;
-        if ((long long)nb * rows > INT_MAX) return fail("search too large");
-        const size_t nr = (size_t)nb * rows * sizeof(float);
-        if (!ok(e.ensure(e.rowCost, nr)) || !ok(e.ensure(e.rowM, nr)) || !ok(e.ensure(e.rowVx, nr))) return false;
-        const Buffer &Lp = P->luma[lvl], &Lc = C->luma[lvl];
-        const int pw = P->lw[lvl], ph = P->lh[lvl], cw = C->lw[lvl], chh = C->lh[lvl];
-        if (!ok(d.run(gpu::kSearchRows, nb * rows,
-                      {Lp, pw, ph, Lc, cw, chh, e.dx, e.dy, mf.bw, mf.block, dd, ws, r, norm, mosh::kMotionLambda,
-                       e.rowCost, e.rowM, e.rowVx})))
-            return false;
-        if (!ok(d.run(gpu::kSearchPick, nb,
-                      {Lp, pw, ph, Lc, cw, chh, e.dx, e.dy, mf.bw, mf.block, dd, ws, r, norm, mosh::kMotionLambda,
-                       e.rowCost, e.rowM, e.rowVx, e.err})))
-            return false;
-    }
-    std::vector<int> flatI;
-    if (mp.fillFlat) {
-        if (!ok(e.ensure(e.flat, nbI))) return false;
-        if (!ok(d.run(gpu::kFlat, nb, {C->luma[0], w, h, mf.bw, mf.block, mp.flatThreshold, e.flat}))) return false;
-        flatI.resize(nb);
-    }
-    if (!ok(d.download(e.dx, mf.dx.data(), nbI)) || !ok(d.download(e.dy, mf.dy.data(), nbI)) ||
-        !ok(d.download(e.err, mf.err.data(), nbI)))
-        return false;
     std::vector<uint8_t> flat;
-    if (mp.fillFlat) {
-        if (!ok(d.download(e.flat, flatI.data(), nbI))) return false;
-        flat.assign(flatI.begin(), flatI.end());
+    int w = 0, h = 0, nb = 0;
+    size_t nbI = 0;
+    {
+        LOCKED();
+        Engine& e = e_;
+        gpu::Device& d = *e.dev;
+        DevFrame* P = e.frame(prev);
+        if (!ok(P != nullptr)) return false;
+        DevFrame* C = e.frame(cur);
+        if (!ok(C != nullptr)) return false;
+        P = e.frame(prev);  // still cached: the cache holds more frames than a step uses
+        if (!P || P->w != C->w || P->h != C->h) return fail("frame sizes differ");
+        w = C->w;
+        h = C->h;
+
+        mf = mosh::newField(w, h, mp);
+        const int levels = mosh::pyramidLevels(w, h);
+        if (!ok(e.pyramid(*P, levels)) || !ok(e.pyramid(*C, levels))) return false;
+        nb = mf.bw * mf.bh;
+        nbI = (size_t)nb * sizeof(int);
+        if (!ok(e.ensure(e.dx, nbI)) || !ok(e.ensure(e.dy, nbI)) || !ok(e.ensure(e.err, nbI))) return false;
+        if (!ok(d.upload(e.dx, mf.dx.data(), nbI)) || !ok(d.upload(e.dy, mf.dy.data(), nbI))) return false;
+
+        for (int lvl = levels - 1; lvl >= 0; --lvl) {
+            const int dd = 1 << lvl;
+            const int ws = mosh::searchWindow(mf, lvl);
+            const int r = mosh::searchRadius(mp, lvl, levels);
+            const float norm = 1.f / float(ws * ws);
+            const int rows = 2 * r + 1;
+            if ((long long)nb * rows > INT_MAX) return fail("search too large");
+            const size_t nr = (size_t)nb * rows * sizeof(float);
+            if (!ok(e.ensure(e.rowCost, nr)) || !ok(e.ensure(e.rowM, nr)) || !ok(e.ensure(e.rowVx, nr))) return false;
+            const Buffer &Lp = P->luma[lvl], &Lc = C->luma[lvl];
+            const int pw = P->lw[lvl], ph = P->lh[lvl], cw = C->lw[lvl], chh = C->lh[lvl];
+            if (!ok(d.run(gpu::kSearchRows, nb * rows,
+                          {Lp, pw, ph, Lc, cw, chh, e.dx, e.dy, mf.bw, mf.block, dd, ws, r, norm, mosh::kMotionLambda,
+                           e.rowCost, e.rowM, e.rowVx})))
+                return false;
+            if (!ok(d.run(gpu::kSearchPick, nb,
+                          {Lp, pw, ph, Lc, cw, chh, e.dx, e.dy, mf.bw, mf.block, dd, ws, r, norm, mosh::kMotionLambda,
+                           e.rowCost, e.rowM, e.rowVx, e.err})))
+                return false;
+        }
+        std::vector<int> flatI;
+        if (mp.fillFlat) {
+            if (!ok(e.ensure(e.flat, nbI))) return false;
+            if (!ok(d.run(gpu::kFlat, nb, {C->luma[0], w, h, mf.bw, mf.block, mp.flatThreshold, e.flat}))) return false;
+            flatI.resize(nb);
+        }
+        if (!ok(d.download(e.dx, mf.dx.data(), nbI)) || !ok(d.download(e.dy, mf.dy.data(), nbI)) ||
+            !ok(d.download(e.err, mf.err.data(), nbI)))
+            return false;
+        if (mp.fillFlat) {
+            if (!ok(d.download(e.flat, flatI.data(), nbI))) return false;
+            flat.assign(flatI.begin(), flatI.end());
+        }
     }
+    // pf runs on the host's threads: never with the GPU locked.
     mosh::postProcessField(mf, flat, mp, pf);
 
     if (mosh::needsRefine(mp)) {
+        LOCKED();
+        Engine& e = e_;
+        gpu::Device& d = *e.dev;
+        // Other renders may have used the GPU since: look the frames up again.
+        DevFrame* P = e.frame(prev);
+        DevFrame* C = P ? e.frame(cur) : nullptr;
+        P = C ? e.frame(prev) : nullptr;
+        if (!ok(P && C)) return false;
+        if (!ok(e.pyramid(*P, 1)) || !ok(e.pyramid(*C, 1))) return false;
         const size_t nOut = (size_t)nb * 11;
-        if (!ok(e.ensure(e.refine, nOut * sizeof(float)))) return false;
+        if (!ok(e.ensure(e.dx, nbI)) || !ok(e.ensure(e.dy, nbI)) || !ok(e.ensure(e.refine, nOut * sizeof(float))))
+            return false;
         if (!ok(d.upload(e.dx, mf.dx.data(), nbI)) || !ok(d.upload(e.dy, mf.dy.data(), nbI))) return false;
         if ((long long)nb * 10 > INT_MAX) return fail("too many blocks");
         if (!ok(d.run(gpu::kRefine, nb * 10,
@@ -389,15 +436,16 @@ bool Session::estimateMotion(const FramePtr& prev, const FramePtr& cur, const mo
 
 bool Session::moshStep(const FramePtr& prev, const FramePtr& cur, const mosh::MotionField& mf,
                        const mosh::StepParams& sp) {
-    if (failed_) return false;
+    LOCKED();
     Engine& e = e_;
+    Work& wk = *w_;
     gpu::Device& d = *e.dev;
     DevFrame* P = e.frame(prev);
     DevFrame* C = e.frame(cur);
     P = P ? e.frame(prev) : nullptr;
     if (!ok(P && C)) return false;
     const int w = C->w, h = C->h;
-    if (P->w != w || P->h != h || e.accW != w || e.accH != h || !e.acc) return fail("frame sizes differ");
+    if (P->w != w || P->h != h || wk.accW != w || wk.accH != h || !wk.acc) return fail("frame sizes differ");
     const int nb = mf.bw * mf.bh;
     std::vector<float> table((size_t)nb * 4, 0.f);
     const bool subpel = mf.subpel();
@@ -415,37 +463,38 @@ bool Session::moshStep(const FramePtr& prev, const FramePtr& cur, const mosh::Mo
     if (!ok(e.ensure(e.table, table.size() * sizeof(float))) ||
         !ok(d.upload(e.table, table.data(), table.size() * sizeof(float))))
         return false;
-    if (e.accTmp && e.accTmp.bytes != e.acc.bytes) e.put(e.accTmp);
-    if (!e.accTmp && !ok(e.get(e.accTmp, e.acc.bytes))) return false;
+    if (wk.accTmp && wk.accTmp.bytes != wk.acc.bytes) e.put(wk.accTmp);
+    if (!wk.accTmp && !ok(e.get(wk.accTmp, wk.acc.bytes))) return false;
     const int n = std::max(1, sp.repeat);
     for (int k = 0; k < n; ++k) {
         if (!ok(d.run(gpu::kStep, w * h,
-                      {P->rgba, C->rgba, e.acc, e.accTmp, w, h, mf.bw, mf.bh, mf.block, e.table, subpel ? 1 : 0,
+                      {P->rgba, C->rgba, wk.acc, wk.accTmp, w, h, mf.bw, mf.bh, mf.block, e.table, subpel ? 1 : 0,
                        sp.residual, sp.clampLevels ? 1 : 0})))
             return false;
-        std::swap(e.acc, e.accTmp);
+        std::swap(wk.acc, wk.accTmp);
     }
     return true;
 }
 
 bool Session::pull(const FramePtr& cur, const mosh::MotionField& mf, const std::vector<uint8_t>& flagged, float rate,
                    float tail) {
-    if (failed_) return false;
+    LOCKED();
     Engine& e = e_;
+    Work& w = *w_;
     DevFrame* C = e.frame(cur);
     if (!ok(C != nullptr)) return false;
     const int nb = mf.bw * mf.bh;
-    if ((int)flagged.size() != nb || e.accW != C->w || e.accH != C->h) return fail("block count differs");
+    if ((int)flagged.size() != nb || w.accW != C->w || w.accH != C->h || !w.acc) return fail("block count differs");
     std::vector<int> f(flagged.begin(), flagged.end());
     if (!ok(e.ensure(e.flags, f.size() * sizeof(int))) || !ok(e.dev->upload(e.flags, f.data(), f.size() * sizeof(int))))
         return false;
     return ok(e.dev->run(gpu::kPull, C->w * C->h,
-                         {e.acc, C->rgba, C->w, mf.bw, mf.bh, mf.block, e.flags, rate, tail}));
+                         {w.acc, C->rgba, C->w, mf.bw, mf.bh, mf.block, e.flags, rate, tail}));
 }
 
 bool Session::refreshActivity(const FramePtr& prev, const FramePtr& cur, const mosh::MotionField& mf,
                               std::vector<float>& sums, std::vector<int>& counts) {
-    if (failed_) return false;
+    LOCKED();
     Engine& e = e_;
     DevFrame* P = e.frame(prev);
     DevFrame* C = e.frame(cur);
@@ -464,13 +513,14 @@ bool Session::refreshActivity(const FramePtr& prev, const FramePtr& cur, const m
 }
 
 bool Session::compose(const FramePtr& to, const mosh::ComposeParams& cp, float q, mosh::Image& out) {
-    if (failed_) return false;
+    LOCKED();
     Engine& e = e_;
+    const Buffer acc = w_->acc;
     gpu::Device& d = *e.dev;
     DevFrame* T = e.frame(to);
     if (!ok(T != nullptr)) return false;
     const int w = T->w, h = T->h, n = w * h;
-    if (e.accW != w || e.accH != h || !e.acc) return fail("frame sizes differ");
+    if (w_->accW != w || w_->accH != h || !acc) return fail("frame sizes differ");
     const size_t bytes = (size_t)n * 4 * sizeof(float);
     q = mosh::clamp01(q);
     const float s = mosh::clamp01(cp.softness);
@@ -505,13 +555,13 @@ bool Session::compose(const FramePtr& to, const mosh::ComposeParams& cp, float q
         const bool colourFirst = cp.mode == mosh::Recovery::ColourFirst;
         const int r = mosh::composeBlurRadius(cp);
         Buffer lowA, lowT;
-        if (!take(lowA) || !take(lowT) || !blur(e.acc, r, lowA) || !blur(T->rgba, r, lowT)) return false;
+        if (!take(lowA) || !take(lowT) || !blur(acc, r, lowA) || !blur(T->rgba, r, lowT)) return false;
         const float lag = 0.1f + 0.5f * s;
         const float kFirst = mosh::smoothstep01(q / (1.f - lag));
         const float kSecond = mosh::smoothstep01((q - lag) / (1.f - lag));
         const float kd = colourFirst ? kSecond : kFirst;
         const float kc = colourFirst ? kFirst : kSecond;
-        if (!ok(d.run(gpu::kBands, n, {e.acc, T->rgba, lowA, lowT, res, kc, kd}))) return false;
+        if (!ok(d.run(gpu::kBands, n, {acc, T->rgba, lowA, lowT, res, kc, kd}))) return false;
     } else if (cp.mode == mosh::Recovery::Slice) {
         const mosh::SliceLayout L = mosh::makeSlices(cp, w, h, s);
         if (!ok(e.ensure(e.band, L.band.size() * sizeof(int))) || !ok(e.ensure(e.start, L.start.size() * sizeof(float))) ||
@@ -522,17 +572,17 @@ bool Session::compose(const FramePtr& to, const mosh::ComposeParams& cp, float q
             !ok(d.upload(e.sign, L.sign.data(), L.sign.size() * sizeof(int))))
             return false;
         if (!ok(d.run(gpu::kSlice, n,
-                      {e.acc, T->rgba, res, w, h, L.columns ? 1 : 0, e.band, e.start, e.sign, q, L.dur})))
+                      {acc, T->rgba, res, w, h, L.columns ? 1 : 0, e.band, e.start, e.sign, q, L.dur})))
             return false;
     } else {
-        Buffer key = e.acc;  // unused by modes without a key
+        Buffer key = acc;  // unused by modes without a key
         float keyNorm = 1.f;
         if (cp.mode == mosh::Recovery::LumaReveal) {
             if (!take(key) || !blur(T->rgba, mosh::composeBlurRadius(cp), key)) return false;
         } else if (cp.mode == mosh::Recovery::Settle) {
             Buffer diff;
             if (!take(diff) || !take(key)) return false;
-            if (!ok(d.run(gpu::kSettleDiff, n, {e.acc, T->rgba, diff})) || !blur(diff, mosh::composeBlurRadius(cp), key))
+            if (!ok(d.run(gpu::kSettleDiff, n, {acc, T->rgba, diff})) || !blur(diff, mosh::composeBlurRadius(cp), key))
                 return false;
             const int ns = (int)(((size_t)n * 4 + 15) / 16);
             if (!ok(e.ensure(e.sample, (size_t)ns * sizeof(float)))) return false;
@@ -546,7 +596,7 @@ bool Session::compose(const FramePtr& to, const mosh::ComposeParams& cp, float q
         const float ww = 0.02f + 0.4f * s;
         const float jag = 0.08f;
         if (!ok(d.run(gpu::kCompose, n,
-                      {e.acc, T->rgba, key, res, w, h, (int)cp.mode, q, block, cp.seed, bw, fw, ww, jag,
+                      {acc, T->rgba, key, res, w, h, (int)cp.mode, q, block, cp.seed, bw, fw, ww, jag,
                        cp.invertReveal ? 1 : 0, keyNorm, (int)cp.direction})))
             return false;
     }
@@ -554,15 +604,21 @@ bool Session::compose(const FramePtr& to, const mosh::ComposeParams& cp, float q
     return ok(d.download(res, out.px.data(), bytes));
 }
 
+#undef LOCKED
+
 // ---------------------------------------------------------------- opening
 
 std::unique_ptr<Session> begin(Preference p, std::string& why) {
     why.clear();
     if (p == Preference::Cpu) return nullptr;
     Engine& e = engine();
-    std::unique_lock<std::mutex> lk(e.m);
+    std::lock_guard<std::mutex> lk(e.m);
     if (!e.broken.empty()) {
         why = e.broken;
+        return nullptr;
+    }
+    if (e.sessions >= kMaxSessions) {
+        why = "GPU busy with other renders";
         return nullptr;
     }
     auto fits = [&]() {
@@ -572,8 +628,11 @@ std::unique_ptr<Session> begin(Preference p, std::string& why) {
         return e.dev->api() == gpu::Api::Cuda || !e.devAnyType;
     };
     if (!fits()) {
-        e.close();
-        struct Try {
+        if (e.sessions > 0) {
+            why = "GPU in use with another Render Device";
+            return nullptr;
+        }
+        e.close();        struct Try {
             gpu::Api api;
             bool anyType;
             bool* tried;
@@ -613,9 +672,8 @@ std::unique_ptr<Session> begin(Preference p, std::string& why) {
             return nullptr;
         }
     }
-    std::unique_ptr<Session> s(new Session(e));
-    s->lock_ = std::move(lk);
-    return s;
+    ++e.sessions;
+    return std::unique_ptr<Session>(new Session(e, e.gen));
 }
 
 void forget(const void* owner) {
@@ -634,7 +692,8 @@ void forget(const void* owner) {
 void shutdown() {
     Engine& e = engine();
     std::lock_guard<std::mutex> g(e.m);
-    e.close();
+    if (e.sessions > 0) e.closeWhenIdle = true;
+    else e.close();
 }
 
 }  // namespace mosh_gpu

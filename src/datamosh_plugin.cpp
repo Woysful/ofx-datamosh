@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -707,9 +708,9 @@ struct Instance {
     };
     std::deque<Stored> stored;
     static constexpr size_t kStoredEntries = 8;
-    // A render that has not finished a step for this long may be waiting on
-    // the host itself; its followers stop waiting for it.
-    static constexpr std::chrono::seconds kStall{10};
+    // A render that has neither fetched a frame nor finished a step for this
+    // long may be waiting on the host itself; its followers stop waiting for it.
+    static constexpr std::chrono::seconds kStall{5};
 
     ~Instance() {
         gCheckpoints.forget(this);
@@ -739,8 +740,9 @@ struct Instance {
         noteStoredLocked(t, cut, hash);
     }
     // Registers a render of frame t of a chain. Waits first while an earlier
-    // frame of the chain, newer than every stored picture, is being rendered.
-    BusyIt enter(double t, double cut, uint64_t hash, double& waitedMs) {
+    // frame of the chain, newer than every stored picture, is being rendered,
+    // unless the host aborts this render (scrubbing).
+    BusyIt enter(double t, double cut, uint64_t hash, const std::function<bool()>& aborted, double& waitedMs) {
         using clock = std::chrono::steady_clock;
         const auto t0 = clock::now();
         std::unique_lock<std::mutex> lk(m);
@@ -752,6 +754,10 @@ struct Instance {
                     ahead = &b;
             if (!ahead || clock::now() - ahead->beat > kStall) break;
             busyDone.wait_for(lk, std::chrono::milliseconds(100));
+            lk.unlock();  // never call the host with m held
+            const bool stop = aborted();
+            lk.lock();
+            if (stop) break;
         }
         waitedMs = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
         busy.push_back({t, cut, hash, clock::now()});
@@ -1924,8 +1930,11 @@ static OfxStatus getFramesNeeded(OfxImageEffectHandle inst, OfxPropertySetHandle
             }
         }
     } else if (pl.s.cutMode == 0) {
+        // The cut is not known yet: anything it could need, Repeat's looped
+        // frames before it included.
         const int L = std::max(1, pl.s.moshLength);
-        for (int k = 1; k <= L + 1; ++k) ts.push_back(t - k);
+        const int extra = pl.s.moshType == kMoshRepeat ? pl.s.repeatFrames : 0;
+        for (int k = 1; k <= L + 1 + extra; ++k) ts.push_back(t - k);
     }
     if (pl.s.view != 0) ts.push_back(t - 1.0);
 
@@ -2013,6 +2022,7 @@ struct FrameSource {
         ++fetched;
         FramePtr f = fetchFrame(clip, t, rect, pf);
         if (keep && f) held->putHeld(t, rect, f);
+        if (ticket) ticket->beat();
         return f;
     }
 };
@@ -2276,33 +2286,45 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
     line("DEV " + fontSafe(cr.device, 72));
 }
 
-// OFX_DATAMOSH_LOG=<file>: one line per render (thread, time spent, time
-// waited for an earlier frame, where the chain started, steps, frames
+// OFX_DATAMOSH_LOG=<file>: a "start" line when a render begins, so a render
+// that never ends shows up, and one line when it ends (thread, time spent,
+// time waited for an earlier frame, where the chain started, steps, frames
 // fetched from the host, device), to see how a host schedules renders.
-static void logRender(double t, double ms, double waitedMs, const Plan& pl, const ChainResult& cr, int fetched) {
+static const char* logPath() {
     static const char* path = getenv("OFX_DATAMOSH_LOG");
-    if (!path || !*path) return;
+    return path && *path ? path : nullptr;
+}
+static void logLine(const char* fmtStr, ...) {
     static std::mutex mu;
     static FILE* fp = nullptr;
     static const auto start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> g(mu);
-    if (!fp) fp = fopen(path, "a");
+    if (!fp) fp = fopen(logPath(), "a");
     if (!fp) return;
     const double at = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(fp, "%10.1f thr %08x ", at, (unsigned)std::hash<std::thread::id>()(std::this_thread::get_id()));
+    va_list ap;
+    va_start(ap, fmtStr);
+    vfprintf(fp, fmtStr, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fflush(fp);
+}
+static void logRender(double t, double ms, double waitedMs, const Plan& pl, const ChainResult& cr, int fetched) {
+    if (!logPath()) return;
     char from[32];
     if (pl.passThrough) snprintf(from, sizeof from, "-");
     else if (cr.fromCache) snprintf(from, sizeof from, cr.fromCheckpoint ? "%.0f ckpt" : "%.0f", cr.startT);
     else snprintf(from, sizeof from, "cut");
-    fprintf(fp, "%10.1f thr %08x t %.1f %8.1f ms wait %7.1f n %d from %s steps %d fetched %d scanned %d %s\n", at,
-            (unsigned)std::hash<std::thread::id>()(std::this_thread::get_id()), t, ms, waitedMs, pl.nFrames, from,
-            cr.stepsDone, fetched, pl.scanned, cr.device.c_str());
-    fflush(fp);
+    logLine("t %.1f %8.1f ms wait %7.1f n %d from %s steps %d fetched %d scanned %d%s %s", t, ms, waitedMs, pl.nFrames,
+            from, cr.stepsDone, fetched, pl.scanned, cr.aborted ? " aborted" : "", cr.device.c_str());
 }
 
 static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) {
     const auto t0 = std::chrono::steady_clock::now();
     double t = 0;
     gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
+    if (logPath()) logLine("t %.1f start", t);
     OfxRectI rw{};
     gProp->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &rw.x1);
     double scale[2] = {1.0, 1.0};
@@ -2370,7 +2392,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     gCheckpoints.trim(budget);
     if (cache && !pl.passThrough) {
         ticket.in = cache;
-        ticket.it = cache->enter(t, pl.cutFrame, chainHash(s, R), waitedMs);
+        ticket.it = cache->enter(t, pl.cutFrame, chainHash(s, R), [&]() { return gEffect->abort(inst) != 0; }, waitedMs);
         fs.ticket = &ticket;
         // As many checkpoints as the budget holds over one mosh, at least
         // kMinEvery frames apart so that saving them costs little.
