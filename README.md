@@ -7,8 +7,8 @@ video with a deleted keyframe does.
 
 ![sample](docs/sample.png)
 
-Works in DaVinci Resolve (Linux, Windows, macOS) and should load in any
-OpenFX 1.4 host that gives filters access to neighbouring frames.
+Made for DaVinci Resolve, and works in other OpenFX hosts that let a filter
+read neighbouring frames, see [Hosts](#hosts).
 
 ## What it does
 
@@ -154,13 +154,43 @@ Or delete the bundle by hand:
 | Windows (Administrator) | `Remove-Item -Recurse -Force "C:\Program Files\Common Files\OFX\Plugins\Datamosh.ofx.bundle"` |
 
 Restart DaVinci Resolve afterwards.
+
+## Hosts
+
+The plugin is a plain OpenFX 1.4 filter (Filter context, RGBA or RGB, 8-bit,
+16-bit or float, CPU rendering) with no host-specific code. It needs one
+thing from the host: **temporal clip access**, i.e. a filter may fetch frames
+other than the one being rendered. A host that reports it does not support
+this gets a clean "missing host feature" error instead of a broken effect.
+
+| Host | Status |
+|---|---|
+| DaVinci Resolve (Linux, Windows, macOS) | The main target, used in practice. |
+| Natron 2.5 (Linux) | Tested headless (Read > Datamosh > Write) with both styles, several recovery modes, a manual cut and the motion-vector view: the same frames as the reference test host, up to 8-bit rounding. Natron honours the "prefers sequential render" hint, so each frame costs one motion step. |
+| Nuke, Fusion Studio, Flame, Baselight, Vegas, HitFilm and other OpenFX hosts | Not tested. Should work when the host gives filters temporal access; please open an issue if it does not. |
+
+Things that differ between hosts and are handled:
+
+* Images whose bounds differ from the output's (padding, a different
+  origin, negative row strides) are mapped onto the output's pixel grid.
+* Proxy / draft renders (render scale below 1): Block Size and Search Range
+  are scaled with the picture, so a proxy looks like a smaller copy of the
+  full-resolution result rather than a chunkier one. It is still an
+  approximation; final renders at full resolution are exact.
+* Hosts that render several frames at once, out of order: the caches are
+  shared safely and give the same result as playing in order, only slower.
+
+The randomness in Encoder intra decisions is seeded by the absolute frame
+number the host passes in, so the same clip placed at another time on a
+timeline can show a slightly different pattern of random intra blocks.
+
 ## Using it in DaVinci Resolve
 
 1. Put the two clips next to each other on the timeline (a plain cut).
 2. Select both, right-click, **New Compound Clip**.
 3. Effects Library > OpenFX > Filters > **Datamosh**, drop it on the
    compound clip.
-4. **Cut: Auto detect** finds the cut by the jump between frames. Set
+4. **Cut: Auto (scene-change detection)** finds the cut by the jump between frames. Set
    **Mosh Length** (frames after the cut) and tune the look.
 
 Why a compound clip: the filter needs to see both sides of the cut as one
@@ -176,7 +206,10 @@ The first frame after the cut is cheap; frame *k* of the mosh needs the
 motion of *k* frame pairs. The plugin caches the previous frame's result, so
 playing or rendering forward costs one motion step per frame. Scrubbing
 backwards or jumping into the middle of a mosh rebuilds the chain from the
-cut (bounded by **Max Motion Steps**). Tips if it is still slow:
+cut (bounded by **Max Motion Steps**). Each source frame is fetched from the
+host once per render and the frame before it is kept from the previous
+render, so in-order playback asks the host for one new frame per frame.
+Tips if it is still slow:
 
 * Block Size 32 is about 4x faster than 16 and looks chunkier, often better.
 * Lower Max Motion Steps (24) to bound the worst case when scrubbing.
@@ -186,13 +219,16 @@ cut (bounded by **Max Motion Steps**). Tips if it is still slow:
 
 The parameters are split into groups in the inspector. Parameters that do
 nothing with the current settings are greyed out (Cut Frame in Auto mode,
-Dark Areas First outside Luma reveal, and so on).
+Dark Areas First outside Luma-keyed refresh, and so on).
+
+The menu entries use codec terms. Earlier versions used plainer names; the
+stored values did not change, so old projects open with the same settings.
 
 **Cut Detection**
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Cut | Auto detect | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame. |
+| Cut | Auto (scene-change detection) | Auto looks back up to Mosh Length frames for a hard cut; Manual uses Cut Frame. |
 | Cut Frame | 0 | Manual mode: first frame of the new shot, in the clip's own frame numbers (Diagnostics shows `T`). |
 | Cut Threshold | 0.12 | Auto mode: frame-to-frame difference that counts as a cut. |
 
@@ -200,7 +236,7 @@ Dark Areas First outside Luma reveal, and so on).
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Mosh Style | Natural | Natural: the new shot replaces the old picture from the first frame after the cut, as in a real stream. Classic: the old picture is smeared on its own until recovery starts (the behaviour before Natural existed). See below. |
+| Mosh Style | Natural (intra decisions, half-pel) | Natural: per-macroblock intra/inter decisions and half-pel motion compensation, so the new shot replaces the old picture from the first frame after the cut, as in a real stream. Classic (full-pel P-blocks): the old picture is smeared on its own until recovery starts (the behaviour before Natural existed). See below. |
 | Mosh Length | 30 | Frames after the cut the mosh lasts, recovery included. |
 | Residual Strength | 1.0 | 0 = pure smear of the old frame, 1 = codec-accurate, >1 overdrive. |
 | New Data Rate | 0.6 | How readily blocks of the new shot are coded intra (fresh) instead of predicted, from the first frame after the cut. 0 = never, about 0.5 behaves like Xvid, higher replaces the old picture faster. |
@@ -212,7 +248,7 @@ Dark Areas First outside Luma reveal, and so on).
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Block Size | 16 | Macroblock size in px. Bigger = chunkier and faster. |
+| Block Size | 16x16 | Macroblock size in px. Bigger = chunkier and faster. |
 | Search Range | 48 | Max motion per step, px. Raise for very fast pans. |
 | Half-pixel Motion | on | Half-pixel vectors with interpolation, like MPEG-4 and H.264; the smear softens as it travels. |
 | Intra Threshold | 0.35 | Extra, absolute intra rule: blocks predicted worse than this always show the new picture. 1 = off. |
@@ -223,13 +259,13 @@ Dark Areas First outside Luma reveal, and so on).
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Recovery | Natural | How the real picture comes back, see below. |
-| Recovery Start | 0.8 | Fraction of the mosh at which the real picture starts to return. Not used by Natural, which heals over the whole mosh. |
+| Recovery | Encoder intra decisions | How the real picture comes back, see below. |
+| Recovery Start | 0.8 | Fraction of the mosh at which the real picture starts to return. Not used by Encoder intra decisions, which heals over the whole mosh. |
 | Recovery Curve | Linear | Pace of the recovery: Linear, Smooth (slow-fast-slow), Ease in (slow start), Ease out (slow end). |
 | Softness | 0.5 | How gradual the recovery is; what exactly it softens depends on the mode, see below. |
-| Dark Areas First | off | Luma reveal only: reveal dark areas first. |
-| Direction | Left to right | Wipe and Slice only: where the new shot comes in from (left, right, top, bottom, from the centre, to the centre). |
-| Seed | 0 | Random order of Block refresh and Motion refresh, the ragged Wipe edge and the Slice bands. |
+| Dark Areas First | off | Luma-keyed refresh only: reveal dark areas first. |
+| Direction | Left to right | Intra refresh sweep and Slice displacement only: where the new shot comes in from (left, right, top, bottom, from the centre, to the centre). |
+| Seed | 0 | Random refresh order, the ragged sweep edge, the slices, and the random intra blocks of Encoder intra decisions. |
 
 **Performance & Debug**
 
@@ -243,40 +279,41 @@ Dark Areas First outside Luma reveal, and so on).
 ![recovery modes](docs/recovery.jpg)
 
 *Frames 14, 18, 21, 24 and 27 of a 30-frame mosh, Recovery Start 0.4
-(Natural ignores it), Softness 0.5, other settings at their defaults.*
+(Encoder intra decisions ignores it), Softness 0.5, other settings at their
+defaults.*
 
-| Mode | What happens | Softness controls |
+| Mode (earlier name) | What happens | Softness controls |
 |---|---|---|
-| Natural | The stream heals the way a real one does, over the whole mosh from the cut on: the encoder codes more and more blocks intra, regions that already show the new shot grow outwards, and a few blocks in static areas are refreshed at random. Whatever is still stale fades in over the last 15%. Recovery Start is not used; Recovery Curve sets the pace. | - |
-| Motion refresh | The stream recovers inside the mosh, like an intra-refresh encoder. Regions where the new shot moves or changes come back first, whole areas at a time; static areas stay moshed longest. Refreshed blocks keep being decoded as P-blocks, so the smear around them keeps flowing in until it washes out. | how long the smear lingers in refreshed blocks |
-| Structure first | The shapes and texture of the new shot appear first, painted with the smeared colours of the old one; then the colours follow. The smoothest, most "one picture turning into another" option. | how long the old colours stay after the shapes arrive |
-| Colour first | The reverse of Structure first: the colours of the new shot wash in under the smeared detail of the old one, then the detail follows. | how long the smeared detail stays after the colours arrive |
-| Settle | Areas where the mosh already looks like the new shot settle first; the worst mismatches stay moshed longest. | width of the soft edge |
-| Luma reveal | The new shot shows through its bright areas first (or dark ones, with Dark Areas First). | width of the soft edge |
-| Wipe | A wipe in the chosen Direction, with a ragged edge one macroblock deep. | width of the soft edge |
-| Slice | The frame is cut into bands 1-4 macroblocks tall (or wide, for top/bottom directions). Each band slides the new shot in and pushes the mosh out, on its own schedule. With the centre directions neighbouring bands slide in opposite ways. | how long each band takes to slide in |
-| Block refresh | Macroblocks come back in random order. | how long each block takes to fade in (0 = they pop) |
-| Dissolve | Crossfade from the moshed picture to the real one. | - |
-| Hard cut | The real picture as soon as recovery starts. | - |
+| Encoder intra decisions (Natural) | The stream heals the way a real one does, over the whole mosh from the cut on: the encoder codes more and more blocks intra, regions that already show the new shot grow outwards, and a few blocks in static areas are refreshed at random. Whatever is still stale fades in over the last 15%. Recovery Start is not used; Recovery Curve sets the pace. | - |
+| Motion-adaptive intra refresh (Motion refresh) | The stream recovers inside the mosh, like an intra-refresh encoder. Regions where the new shot moves or changes come back first, whole areas at a time; static areas stay moshed longest. Refreshed blocks keep being decoded as P-blocks, so the smear around them keeps flowing in until it washes out. | how long the smear lingers in refreshed blocks |
+| High-frequency first (Structure first) | The high band of the new shot (edges, texture) appears first over the smeared low band (colours) of the old one; then the low band follows. The smoothest, most "one picture turning into another" option. | how long the old colours stay after the shapes arrive |
+| Low-frequency first (Colour first) | The reverse of High-frequency first: the low band (colours) of the new shot washes in under the smeared detail of the old one, then the detail follows. | how long the smeared detail stays after the colours arrive |
+| Residual-ordered refresh (Settle) | Areas with the smallest residual between the mosh and the new shot settle first; the worst mismatches stay moshed longest. | width of the soft edge |
+| Luma-keyed refresh (Luma reveal) | The new shot shows through its bright areas first (or dark ones, with Dark Areas First). | width of the soft edge |
+| Intra refresh sweep (Wipe) | A refresh front sweeps across the frame in the chosen Direction, like periodic intra refresh, with a ragged edge one macroblock deep. | width of the soft edge |
+| Slice displacement (Slice) | The frame is cut into slices 1-4 macroblocks tall (or wide, for top/bottom directions). Each slice shifts the new shot in and pushes the mosh out, on its own schedule. With the centre directions neighbouring slices shift in opposite ways. | how long each slice takes to shift in |
+| Random intra refresh (Block refresh) | Macroblocks are refreshed in random order. | how long each block takes to fade in (0 = they pop) |
+| Crossfade (Dissolve) | Linear blend from the moshed picture to the real one. | - |
+| IDR frame (Hard cut) | The real picture as soon as recovery starts, like the next keyframe. | - |
 
-All modes except Natural start at Recovery Start. New Data Rate works in
+All modes except Encoder intra decisions start at Recovery Start. New Data Rate works in
 every mode, so the new shot starts coming in at the cut with any of them;
 set it to 0 for a pure smear until recovery.
 
-To get the 1.4 look back exactly: Mosh Style Classic, Recovery Block
-refresh, Softness 0 (Residual Strength 0.6, which Classic sets).
+To get the 1.4 look back exactly: Mosh Style Classic, Recovery Random
+intra refresh, Softness 0 (Residual Strength 0.6, which Classic sets).
 
 ### Mosh styles
 
 | Style | What it does | Defaults it brings |
 |---|---|---|
-| Natural | Encoder-style intra decisions (New Data Rate) and half-pixel motion: fresh blocks of the new shot appear from the first frame after the cut and travel with the motion, so the two shots merge gradually. | Residual Strength 1.0, Recovery Natural |
-| Classic | No intra decisions besides Intra Threshold, whole-pixel motion: the old picture is smeared by the new shot's motion and the new shot comes back during recovery. New Data Rate and Half-pixel Motion are greyed out. | Residual Strength 0.6, Recovery Motion refresh |
+| Natural (intra decisions, half-pel) | Encoder-style intra/inter decisions (New Data Rate) and half-pixel motion: fresh blocks of the new shot appear from the first frame after the cut and travel with the motion, so the two shots merge gradually. | Residual Strength 1.0, Recovery Encoder intra decisions |
+| Classic (full-pel P-blocks) | No intra decisions besides Intra Threshold, whole-pixel motion: the old picture is smeared by the new shot's motion and the new shot comes back during recovery. New Data Rate and Half-pixel Motion are greyed out. | Residual Strength 0.6, Recovery Motion-adaptive intra refresh |
 
 When you switch style, Residual Strength and Recovery move to the new
 style's defaults, but only if they were still at the old style's defaults;
-values you changed stay. Every Recovery mode, Natural included, works with
-both styles.
+values you changed stay. Every Recovery mode, Encoder intra decisions
+included, works with both styles.
 
 Looks to start from:
 
@@ -284,12 +321,14 @@ Looks to start from:
 * Natural transition, like a real mosh: the defaults. Raise New Data Rate
   for a faster hand-over, lower it (0.3-0.4) and set Recovery Curve to
   Ease in for a long smear that heals late.
-* Long, flowing transition between shots: Recovery Motion refresh or
-  Structure first, Recovery Start 0.4-0.5, Recovery Curve Smooth.
+* Long, flowing transition between shots: Recovery Motion-adaptive intra
+  refresh or High-frequency first, Recovery Start 0.4-0.5, Recovery Curve
+  Smooth.
 * Pure liquid smear of the old picture, no new colours: Residual 0,
   New Data Rate 0, Intra Threshold 1.
-* Short glitch: Mosh Length 12, Recovery Start 0.6, Recovery Hard cut.
-* Glitchy hand-off: Recovery Slice, Softness 0.2-0.4, Block Size 32.
+* Short glitch: Mosh Length 12, Recovery Start 0.6, Recovery IDR frame.
+* Glitchy hand-off: Recovery Slice displacement, Softness 0.2-0.4, Block
+  Size 32x32.
 
 ## Reading the Diagnostics view
 
@@ -304,9 +343,9 @@ Set **View** to **Diagnostics** on a frame just after the cut:
 * `MV` is the mean motion vector length in px. `CACHED` / `FULL` says
   whether the frame reused the previous result or rebuilt the chain.
 * `Q` is the recovery progress (0..1, after the Recovery Curve), `REC` the
-  recovery mode number, `REFR` the share of blocks Motion refresh has
-  already refreshed (Natural: blocks that already carry the new shot), in
-  percent. `INTRA` is the share of blocks coded intra in this frame.
+  recovery mode number (0-10 in menu order), `REFR` the share of blocks
+  Motion-adaptive intra refresh has already refreshed (Encoder intra
+  decisions: blocks that already carry the new shot), in percent. `INTRA` is the share of blocks coded intra in this frame.
 
 ## Build from source
 
@@ -413,7 +452,13 @@ Any parameter can be set after the view argument as `name=value`, e.g.
 `... out.rgb 0 recoverMode=4 recoverStart=0.4`. `MOCK_PURGE=1` drops the
 plugin's cache before every frame (like scrubbing), so the output can be
 compared with a normal sequential run; `MOCK_PARAMS=1` prints each
-parameter's group and enabled state and exits.
+parameter's group and enabled state and exits. Other switches emulate what
+real hosts do differently: `MOCK_THREADS=n` provides the multithread suite
+with n threads, `MOCK_SCALE=0.5` renders at a render scale (output scaled
+back up), `MOCK_PAD=n` gives source images an n-pixel border beyond the
+output's bounds, `MOCK_OFFSET=n` moves every image's origin to (n, n),
+`MOCK_NO_TEMPORAL=1` reports a host without temporal clip access. The host
+prints the total and average time spent in render.
 
 `build/mosh_test` runs only the algorithm core on two raw clips.
 

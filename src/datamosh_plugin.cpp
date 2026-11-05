@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstddef>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -239,8 +241,9 @@ struct HostImage {
     int width() const { return b.x2 - b.x1; }
     int height() const { return b.y2 - b.y1; }
 
+    // rowBytes may be negative (top-down storage), so the offset is signed.
     unsigned char* row(int y) const {
-        return static_cast<unsigned char*>(data) + (size_t)(y - b.y1) * rowBytes;
+        return static_cast<unsigned char*>(data) + (ptrdiff_t)(y - b.y1) * (ptrdiff_t)rowBytes;
     }
 
     // Channel value at image-local (x, y) as float 0..1, without converting the whole frame.
@@ -252,64 +255,129 @@ struct HostImage {
         return *p / 255.f;
     }
 
-    // Convert to float RGBA.
-    void toImage(mosh::Image& img) const {
-        img.resize(width(), height());
-        for (int y = 0; y < img.h; ++y) {
-            const unsigned char* r = row(y + b.y1);
-            for (int x = 0; x < img.w; ++x) {
-                float* o = img.at(x, y);
-                const unsigned char* p = r + (size_t)x * ncomp * bytesPerComp;
-                float c[4] = {0.f, 0.f, 0.f, 1.f};
-                for (int k = 0; k < ncomp; ++k) {
-                    float v;
-                    if (bytesPerComp == 4) v = reinterpret_cast<const float*>(p)[k];
-                    else if (bytesPerComp == 2) v = reinterpret_cast<const unsigned short*>(p)[k] / 65535.f;
-                    else v = p[k] / 255.f;
-                    c[k] = v;
+    // Convert to float RGBA over the pixel rectangle r (normally the output
+    // image's bounds), so every frame lines up with the output whatever
+    // bounds the host gave this one. Pixels outside this image stay 0.
+    void toImage(mosh::Image& img, const OfxRectI& r, const mosh::ParallelFor& pf) const {
+        img.resize(r.x2 - r.x1, r.y2 - r.y1);
+        const int x0 = std::max(r.x1, b.x1), x1 = std::min(r.x2, b.x2);
+        const bool fast = ncomp == 4 && bytesPerComp == 4;
+        pf(img.h, [&](int y0, int y1) {
+            for (int iy = y0; iy < y1; ++iy) {
+                const int y = iy + r.y1;
+                float* orow = img.at(0, iy);
+                if (y < b.y1 || y >= b.y2 || x0 >= x1) {
+                    std::fill(orow, orow + (size_t)img.w * 4, 0.f);
+                    continue;
                 }
-                if (ncomp == 1) { c[3] = c[0]; c[0] = c[1] = c[2] = 0.f; }
-                o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = c[3];
+                std::fill(orow, orow + (size_t)(x0 - r.x1) * 4, 0.f);
+                std::fill(orow + (size_t)(x1 - r.x1) * 4, orow + (size_t)img.w * 4, 0.f);
+                const unsigned char* src = row(y) + (size_t)(x0 - b.x1) * ncomp * bytesPerComp;
+                float* o = orow + (size_t)(x0 - r.x1) * 4;
+                if (fast) {
+                    memcpy(o, src, (size_t)(x1 - x0) * 4 * sizeof(float));
+                    continue;
+                }
+                for (int x = x0; x < x1; ++x, o += 4, src += (size_t)ncomp * bytesPerComp) {
+                    float c[4] = {0.f, 0.f, 0.f, 1.f};
+                    for (int k = 0; k < ncomp; ++k) {
+                        float v;
+                        if (bytesPerComp == 4) v = reinterpret_cast<const float*>(src)[k];
+                        else if (bytesPerComp == 2) v = reinterpret_cast<const unsigned short*>(src)[k] / 65535.f;
+                        else v = src[k] / 255.f;
+                        c[k] = v;
+                    }
+                    if (ncomp == 1) { c[3] = c[0]; c[0] = c[1] = c[2] = 0.f; }
+                    o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = c[3];
+                }
             }
-        }
+        });
     }
 
-    // Write float RGBA into this (output) image inside the render window.
-    void fromImage(const mosh::Image& img, const OfxRectI& rw) const {
-        for (int y = rw.y1; y < rw.y2; ++y) {
-            if (y < b.y1 || y >= b.y2) continue;
-            unsigned char* r = row(y);
-            const int iy = std::min(std::max(y - b.y1, 0), img.h - 1);
-            for (int x = rw.x1; x < rw.x2; ++x) {
-                if (x < b.x1 || x >= b.x2) continue;
-                const int ix = std::min(std::max(x - b.x1, 0), img.w - 1);
-                const float* s = img.at(ix, iy);
-                unsigned char* p = r + (size_t)(x - b.x1) * ncomp * bytesPerComp;
-                float c[4] = {s[0], s[1], s[2], s[3]};
-                if (ncomp == 1) c[0] = s[3];
-                for (int k = 0; k < ncomp; ++k) {
-                    if (bytesPerComp == 4) {
-                        reinterpret_cast<float*>(p)[k] = c[k];
-                    } else {
-                        const float v = std::min(std::max(c[k], 0.f), 1.f);
-                        if (bytesPerComp == 2) reinterpret_cast<unsigned short*>(p)[k] = (unsigned short)(v * 65535.f + 0.5f);
-                        else p[k] = (unsigned char)(v * 255.f + 0.5f);
+    // Write float RGBA, whose pixel (0,0) sits at (org.x1, org.y1), into this
+    // (output) image inside the render window.
+    void fromImage(const mosh::Image& img, const OfxRectI& org, const OfxRectI& rw,
+                   const mosh::ParallelFor& pf) const {
+        const int ry1 = std::max(rw.y1, b.y1), ry2 = std::min(rw.y2, b.y2);
+        const int rx1 = std::max(rw.x1, b.x1), rx2 = std::min(rw.x2, b.x2);
+        if (ry1 >= ry2 || rx1 >= rx2 || img.empty()) return;
+        // Columns that map straight into img without clamping.
+        const int cx1 = std::max(rx1, org.x1), cx2 = std::min(rx2, org.x1 + img.w);
+        const bool fast = ncomp == 4 && bytesPerComp == 4;
+        pf(ry2 - ry1, [&](int j0, int j1) {
+            for (int y = ry1 + j0; y < ry1 + j1; ++y) {
+                unsigned char* r = row(y);
+                const int iy = std::min(std::max(y - org.y1, 0), img.h - 1);
+                if (fast && cx1 < cx2) {
+                    memcpy(r + (size_t)(cx1 - b.x1) * 4 * sizeof(float), img.at(cx1 - org.x1, iy),
+                           (size_t)(cx2 - cx1) * 4 * sizeof(float));
+                }
+                for (int x = rx1; x < rx2; ++x) {
+                    if (fast && x >= cx1 && x < cx2) {
+                        x = cx2 - 1;
+                        continue;
+                    }
+                    const int ix = std::min(std::max(x - org.x1, 0), img.w - 1);
+                    const float* s = img.at(ix, iy);
+                    unsigned char* p = r + (size_t)(x - b.x1) * ncomp * bytesPerComp;
+                    float c[4] = {s[0], s[1], s[2], s[3]};
+                    if (ncomp == 1) c[0] = s[3];
+                    for (int k = 0; k < ncomp; ++k) {
+                        if (bytesPerComp == 4) {
+                            reinterpret_cast<float*>(p)[k] = c[k];
+                        } else {
+                            const float v = std::min(std::max(c[k], 0.f), 1.f);
+                            if (bytesPerComp == 2) reinterpret_cast<unsigned short*>(p)[k] = (unsigned short)(v * 65535.f + 0.5f);
+                            else p[k] = (unsigned char)(v * 255.f + 0.5f);
+                        }
                     }
                 }
             }
-        }
+        });
     }
 };
 
-static bool fetchAsImage(OfxImageClipHandle clip, double t, mosh::Image& img) {
+using FramePtr = std::shared_ptr<const mosh::Image>;
+
+static FramePtr fetchFrame(OfxImageClipHandle clip, double t, const OfxRectI& r, const mosh::ParallelFor& pf) {
     HostImage hi;
-    if (!hi.fetch(clip, t)) return false;
-    hi.toImage(img);
-    return true;
+    if (!hi.fetch(clip, t)) return nullptr;
+    auto img = std::make_shared<mosh::Image>();
+    hi.toImage(*img, r, pf);
+    return img;
 }
 
-// Subsampled mean absolute RGB difference between two host images.
-static float quickDiff(const HostImage& a, const HostImage& b) {
+// A frame for cut detection: either already converted, or a raw host image
+// (scanning back through the clip only needs a sparse sample of each frame).
+struct ScanFrame {
+    OfxRectI rect{0, 0, 0, 0};  // the output's pixel rectangle; (x, y) below are relative to it
+    HostImage host;
+    FramePtr img;
+
+    void set(const FramePtr& p) {
+        host.release();
+        img = p;
+    }
+    bool fetch(OfxImageClipHandle clip, double t) {
+        img.reset();
+        return host.fetch(clip, t);
+    }
+    int width() const { return rect.x2 - rect.x1; }
+    int height() const { return rect.y2 - rect.y1; }
+    float sample(int x, int y, int ch) const {
+        if (img) return img->at(x, y)[ch];
+        const int hx = x + rect.x1 - host.b.x1, hy = y + rect.y1 - host.b.y1;
+        if (hx < 0 || hy < 0 || hx >= host.width() || hy >= host.height()) return 0.f;
+        return host.sample(hx, hy, ch);
+    }
+    void swap(ScanFrame& o) {
+        host.swap(o.host);
+        img.swap(o.img);
+    }
+};
+
+// Subsampled mean absolute RGB difference between two frames.
+static float quickDiff(const ScanFrame& a, const ScanFrame& b) {
     if (a.width() != b.width() || a.height() != b.height()) return -1.f;
     const int step = std::max(2, a.width() / 160);
     double s = 0;
@@ -402,9 +470,10 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
 }
 
 // Hash of everything that changes the accumulated (pre-recovery) picture.
-static uint64_t chainHash(const Settings& s) {
+static uint64_t chainHash(const Settings& s, const OfxRectI& r) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    mix((uint64_t)(uint32_t)r.x1); mix((uint64_t)(uint32_t)r.y1); mix((uint64_t)(uint32_t)r.x2); mix((uint64_t)(uint32_t)r.y2);
     auto mixf = [&](float f) { uint32_t u; memcpy(&u, &f, 4); mix(u); };
     mix((uint64_t)s.block); mix((uint64_t)s.range); mixf(s.motionScale); mixf(s.residual);
     mix((uint64_t)s.repeat); mixf(s.intraThreshold); mix(s.smooth); mix(s.fillFlat);
@@ -450,6 +519,11 @@ struct Instance {
         std::vector<uint8_t> refreshed;  // Motion refresh: blocks already refreshed
     };
     std::deque<AccEntry> accCache;  // most recent last, at most kAccEntries
+    // Last source frame converted by a render, so the next frame's render
+    // does not fetch and convert it again.
+    double frameT = 0;
+    OfxRectI frameRect{0, 0, 0, 0};
+    FramePtr frame;
 
     static constexpr size_t kAccEntries = 2;
     static constexpr size_t kMaxDiffs = 100000;
@@ -458,6 +532,18 @@ struct Instance {
         std::lock_guard<std::mutex> g(m);
         pairDiff.clear();
         accCache.clear();
+        frame.reset();
+    }
+    FramePtr getFrame(double t, const OfxRectI& r) {
+        std::lock_guard<std::mutex> g(m);
+        if (!frame || frameT != t || memcmp(&frameRect, &r, sizeof r)) return nullptr;
+        return frame;
+    }
+    void putFrame(double t, const OfxRectI& r, const FramePtr& f) {
+        std::lock_guard<std::mutex> g(m);
+        frameT = t;
+        frameRect = r;
+        frame = f;
     }
     bool getDiff(long f, float& d) {
         std::lock_guard<std::mutex> g(m);
@@ -481,15 +567,15 @@ struct Instance {
             }
         return false;
     }
-    void putAcc(double t, double cut, uint64_t hash, const mosh::Image& acc, const std::vector<uint8_t>& refreshed) {
+    void putAcc(double t, double cut, uint64_t hash, mosh::Image acc, const std::vector<uint8_t>& refreshed) {
         std::lock_guard<std::mutex> g(m);
         for (AccEntry& e : accCache)
             if (e.t == t && e.cutFrame == cut && e.hash == hash) {
-                e.acc = acc;
+                e.acc = std::move(acc);
                 e.refreshed = refreshed;
                 return;
             }
-        accCache.push_back({t, cut, hash, acc, refreshed});
+        accCache.push_back({t, cut, hash, std::move(acc), refreshed});
         while (accCache.size() > kAccEntries) accCache.pop_front();
     }
 };
@@ -600,19 +686,26 @@ static Plan makePlan(OfxImageEffectHandle inst, double t) {
 
 // Auto cut detection: walk back from t and stop at the most recent pair of
 // consecutive frames that differ a lot. That pair is where the removed
-// keyframe would have been.
-static void detectCut(OfxImageClipHandle src, Instance* cache, Plan& pl) {
+// keyframe would have been. cur (frame t) and prev (frame t - 1) are used
+// when already converted, saving host fetches.
+static void detectCut(OfxImageClipHandle src, Instance* cache, Plan& pl, const OfxRectI& rect, const FramePtr& cur,
+                      const FramePtr& prev) {
     pl.cutKnown = false;
     pl.scanMaxDiff = -1.f;
     const int L = std::max(1, pl.s.moshLength);
-    HostImage a, b;
+    ScanFrame a, b;
+    a.rect = b.rect = rect;
     bool haveA = false;
     for (int k = 0; k < L; ++k) {
         const double fa = pl.t - k;
         float d;
         if (!cache || !cache->getDiff((long)std::lround(fa), d)) {
-            if (!haveA && !a.fetch(src, fa)) return;
-            if (!b.fetch(src, fa - 1.0)) break;
+            if (!haveA) {
+                if (k == 0 && cur) a.set(cur);
+                else if (!a.fetch(src, fa)) return;
+            }
+            if (k == 0 && prev) b.set(prev);
+            else if (!b.fetch(src, fa - 1.0)) break;
             d = quickDiff(a, b);
             ++pl.scanned;
             if (cache) cache->putDiff((long)std::lround(fa), d);
@@ -631,7 +724,6 @@ static void detectCut(OfxImageClipHandle src, Instance* cache, Plan& pl) {
     if (pl.cutKnown) finishPlan(pl);
     else pl.passThrough = true;
 }
-
 // ---------------------------------------------------------------- actions
 
 static OfxStatus onLoad() {
@@ -645,6 +737,13 @@ static OfxStatus onLoad() {
 }
 
 static OfxStatus describe(OfxImageEffectHandle effect) {
+    // Every frame depends on earlier frames of the clip; a host that only
+    // hands out the current frame cannot run this effect.
+    int temporal = 1;
+    if (gHost->host && gProp->propGetInt(gHost->host, kOfxImageEffectPropTemporalClipAccess, 0, &temporal) == kOfxStatOK &&
+        !temporal)
+        return kOfxStatErrMissingHostFeature;
+
     OfxPropertySetHandle props = nullptr;
     gEffect->getPropertySet(effect, &props);
 
@@ -670,6 +769,9 @@ static OfxStatus describe(OfxImageEffectHandle effect) {
     gProp->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipDepths, 0, 0);
     gProp->propSetString(props, kOfxImageEffectPluginRenderThreadSafety, 0, kOfxImageEffectRenderFullySafe);
     gProp->propSetInt(props, kOfxImageEffectPluginPropHostFrameThreading, 0, 0);
+    // Any order works, but in order each frame costs one motion step instead
+    // of a chain since the cut (OFX 1.4: 2 = prefers sequential).
+    gProp->propSetInt(props, kOfxImageEffectInstancePropSequentialRender, 0, 2);
     return kOfxStatOK;
 }
 
@@ -692,7 +794,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     defineChoice(ps, P::kCutMode, "Cut",
                  "Where the keyframe goes missing. Auto looks back for the most recent hard cut in the clip; "
                  "Manual uses the frame below.",
-                 {"Auto detect", "Manual frame"}, 0);
+                 {"Auto (scene-change detection)", "Manual frame"}, 0);
     defineInt(ps, P::kCutFrame, "Cut Frame",
               "Manual mode: first frame of the new shot, in the clip's own frame numbers (see Diagnostics).",
               0, 0, 1000000);
@@ -703,12 +805,14 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
 
     beginGroup(ps, P::kGrpMosh, "Mosh", "How the old picture is dragged and smeared.", true);
     defineChoice(ps, P::kMoshStyle, "Mosh Style",
-                 "Natural: the new shot replaces the old picture from the first frame after the cut, the way "
-                 "it does in a real stream with a deleted keyframe (encoder intra decisions, half-pixel motion). "
-                 "Classic: the old picture is smeared on its own until recovery starts, as in earlier versions. "
+                 "Natural (intra decisions, half-pel): the new shot replaces the old picture from the first frame "
+                 "after the cut, the way it does in a real stream with a deleted keyframe: encoder-style intra/inter "
+                 "mode decisions per macroblock and half-pixel motion compensation. "
+                 "Classic (full-pel P-blocks): the old picture is smeared by whole-pixel motion compensation alone "
+                 "until recovery starts, as in earlier versions. "
                  "Switching also moves Residual Strength and Recovery to the style's defaults if they were left "
                  "at the other style's defaults.",
-                 {"Natural", "Classic"}, 0);
+                 {"Natural (intra decisions, half-pel)", "Classic (full-pel P-blocks)"}, 0);
     defineInt(ps, P::kMoshLength, "Mosh Length",
               "How many frames after the cut the mosh lasts (including recovery).", 30, 2, 600);
     defineDouble(ps, P::kResidual, "Residual Strength",
@@ -732,7 +836,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
     beginGroup(ps, P::kGrpMotion, "Motion Estimation", "How motion vectors are found in the new shot.", true);
     defineChoice(ps, P::kBlockSize, "Block Size",
                  "Macroblock size in pixels. Larger blocks look chunkier and render faster.",
-                 {"8", "16", "32", "64"}, 1);
+                 {"8x8", "16x16", "32x32", "64x64"}, 1);
     defineInt(ps, P::kSearchRange, "Search Range", "Maximum motion per frame step, in pixels.", 48, 4, 256);
     defineDouble(ps, P::kIntra, "Intra Threshold",
                  "Blocks whose motion prediction is worse than this show the new picture directly, "
@@ -749,39 +853,50 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
 
     beginGroup(ps, P::kGrpRecovery, "Recovery", "How the real picture of the new shot comes back.", true);
     defineChoice(ps, P::kRecoverMode, "Recovery",
-                 "How the real picture returns. Block refresh: macroblocks come back in random order. "
-                 "Dissolve: crossfade. Hard cut: instantly. Motion refresh: blocks where the new shot moves "
-                 "come back first, inside the mosh, so the smear keeps flowing through them. Structure first: "
-                 "the shapes of the new shot appear in the smeared colours, then the colours follow. "
-                 "Luma reveal: the new shot shows through its bright areas first. Colour first: the colours "
-                 "of the new shot wash in under the smear, then the detail follows. Settle: areas where the "
-                 "mosh is already close to the new shot settle first, the worst mismatches last. Wipe: a wipe "
-                 "with a ragged macroblock edge. Slice: bands of macroblocks slide the new shot in and push "
-                 "the mosh out. Natural: the stream heals the way a real one does, the encoder codes more and "
-                 "more blocks as intra until the whole picture is fresh.",
-                 {"Block refresh", "Dissolve", "Hard cut", "Motion refresh", "Structure first", "Luma reveal",
-                  "Colour first", "Settle", "Wipe", "Slice", "Natural"},
+                 "How the real picture returns. Random intra refresh: macroblocks are refreshed in random "
+                 "order. Crossfade: linear blend. IDR frame: the whole picture at once, like the next "
+                 "keyframe. Motion-adaptive intra refresh: macroblocks where the new shot moves are refreshed "
+                 "first, inside the mosh, and keep being predicted afterwards, so the smear flows through them. "
+                 "High-frequency first: the high band (edges, texture) of the new shot arrives over the smeared "
+                 "low band, then the low band follows. Luma-keyed refresh: the new shot shows through its bright "
+                 "areas first. Low-frequency first: the low band (colours) washes in under the smeared detail, "
+                 "then the high band follows. Residual-ordered refresh: areas with the smallest residual against "
+                 "the new shot settle first, the worst mismatches last. Intra refresh sweep: a refresh front "
+                 "sweeps across the frame with a ragged macroblock edge, like periodic intra refresh. Slice "
+                 "displacement: slices of macroblocks shift the new shot in and push the mosh out. Encoder intra "
+                 "decisions: the stream heals the way a real one does, the encoder codes more and more "
+                 "macroblocks as intra until the whole picture is fresh.",
+                 {"Random intra refresh", "Crossfade", "IDR frame", "Motion-adaptive intra refresh",
+                  "High-frequency first", "Luma-keyed refresh", "Low-frequency first", "Residual-ordered refresh",
+                  "Intra refresh sweep", "Slice displacement", "Encoder intra decisions"},
                  kDefaultRecovery);
     defineDouble(ps, P::kRecoverStart, "Recovery Start",
-                 "Fraction of the mosh at which the real picture starts to come back.", 0.8, 0.05, 1.0);
+                 "Fraction of the mosh at which the real picture starts to come back. Not used by Encoder intra "
+                 "decisions, which heals over the whole mosh.",
+                 0.8, 0.05, 1.0);
     defineChoice(ps, P::kRecoverCurve, "Recovery Curve",
                  "Pace of the recovery: steady, slow-fast-slow, slow start, or slow end.",
                  {"Linear", "Smooth", "Ease in", "Ease out"}, 0);
     defineDouble(ps, P::kRecoverSoftness, "Softness",
-                 "How gradual the recovery is. Block refresh: how long each block takes to fade in. "
-                 "Motion refresh: how long the smear lingers in refreshed blocks. Structure first: how long "
-                 "the old colours stay after the shapes arrive. Colour first: how long the smeared detail "
-                 "stays after the colours arrive. Luma reveal, Settle, Wipe: width of the soft edge. "
-                 "Slice: how long each band takes to slide in.",
+                 "How gradual the recovery is. Random intra refresh: how long each block takes to fade in. "
+                 "Motion-adaptive intra refresh: how long the smear lingers in refreshed blocks. High-frequency "
+                 "first: how long the old low band stays after the high band arrives. Low-frequency first: how "
+                 "long the smeared detail stays after the colours arrive. Luma-keyed refresh, Residual-ordered "
+                 "refresh, Intra refresh sweep: width of the soft edge. Slice displacement: how long each slice "
+                 "takes to shift in.",
                  0.5, 0.0, 1.0);
-    defineBool(ps, P::kRevealInvert, "Dark Areas First", "Luma reveal: reveal dark areas first instead of bright ones.",
+    defineBool(ps, P::kRevealInvert, "Dark Areas First",
+               "Luma-keyed refresh: reveal dark areas first instead of bright ones.",
                false);
     defineChoice(ps, P::kDirection, "Direction",
-                 "Wipe and Slice: where the new shot comes in from. Slice uses rows for left/right and "
-                 "columns for top/bottom; the centre options make neighbouring rows slide in opposite ways.",
+                 "Intra refresh sweep and Slice displacement: where the new shot comes in from. Slices are rows "
+                 "for left/right and columns for top/bottom; the centre options make neighbouring slices shift "
+                 "in opposite ways.",
                  {"Left to right", "Right to left", "Top to bottom", "Bottom to top", "From centre", "To centre"},
                  0);
-    defineInt(ps, P::kSeed, "Seed", "Changes the random order of block refresh, wipe edge and slices.", 0, 0, 9999);
+    defineInt(ps, P::kSeed, "Seed",
+              "Changes the random refresh order, the ragged sweep edge, the slices and the random intra blocks "
+              "of Encoder intra decisions.", 0, 0, 9999);
 
     beginGroup(ps, P::kGrpAdvanced, "Performance & Debug", "Speed limits and debug views.", true);
     defineInt(ps, P::kMaxSteps, "Max Motion Steps",
@@ -945,11 +1060,31 @@ struct ChainResult {
     float firstPairDiff = -1.f;
     int stepsDone = 0;
     bool fromCache = false;
+    bool aborted = false;
     std::vector<uint8_t> refreshed;  // Motion refresh state, carried along the chain
 };
 
+// Source frames for one render, converted to the output's pixel rectangle.
+// The frame at the render time is fetched once and shared by every stage;
+// the previous frame may come from the instance cache.
+struct FrameSource {
+    OfxImageClipHandle clip = nullptr;
+    OfxRectI rect{0, 0, 0, 0};
+    mosh::ParallelFor pf;
+    double tCur = 0;
+    FramePtr cur;
+    double tPrev = 0;
+    FramePtr prev;
+
+    FramePtr get(double t) const {
+        if (cur && t == tCur) return cur;
+        if (prev && t == tPrev) return prev;
+        return fetchFrame(clip, t, rect, pf);
+    }
+};
+
 // Runs motion steps over frames `times` on top of acc.
-static void runSteps(OfxImageEffectHandle inst, OfxImageClipHandle src, const Plan& pl,
+static void runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Plan& pl,
                      const std::vector<double>& times, mosh::Image& acc, ChainResult& cr,
                      const mosh::ParallelFor& pf) {
     const Settings& s = pl.s;
@@ -971,29 +1106,33 @@ static void runSteps(OfxImageEffectHandle inst, OfxImageClipHandle src, const Pl
     const mosh::MotionParams mp = motionParams(s);
 
     if (times.size() < 2) return;
-    mosh::Image prev, cur, scratch;
-    if (!fetchAsImage(src, times[0], prev)) return;
+    mosh::Image scratch;
+    FramePtr prev = fs.get(times[0]);
+    if (!prev) return;
     for (size_t i = 1; i < times.size(); ++i) {
-        if (!fetchAsImage(src, times[i], cur)) break;
-        if (gEffect->abort(inst)) break;
-        if (i == 1) cr.firstPairDiff = meanAbsDiff(prev, cur);
-        cr.lastField = mosh::estimateMotion(prev, cur, mp, pf);
+        FramePtr cur = fs.get(times[i]);
+        if (!cur) break;
+        if (gEffect->abort(inst)) {
+            cr.aborted = true;
+            break;
+        }
+        if (i == 1) cr.firstPairDiff = meanAbsDiff(*prev, *cur);
+        cr.lastField = mosh::estimateMotion(*prev, *cur, mp, pf);
         if (natural) {
             ns.q = naturalAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
             ns.frame = std::lround(times[i]);
             mosh::naturalIntra(cr.lastField, ns, cr.refreshed);
         }
-        mosh::moshStep(prev, cur, cr.lastField, sp, acc, scratch, pf);
-        if (natural) mosh::naturalAfter(cur, cr.lastField, ns, cr.refreshed, acc, pf);
+        mosh::moshStep(*prev, *cur, cr.lastField, sp, acc, scratch, pf);
+        if (natural) mosh::naturalAfter(*cur, cr.lastField, ns, cr.refreshed, acc, pf);
         if (refresh) {
             rs.q = recoveryAmount(s, (times[i] - pl.cutFrame) / (double)std::max(1, s.moshLength));
-            mosh::refreshStep(prev, cur, cr.lastField, rs, cr.refreshed, acc, pf);
+            mosh::refreshStep(*prev, *cur, cr.lastField, rs, cr.refreshed, acc, pf);
         }
-        std::swap(prev, cur);
+        prev = std::move(cur);
         ++cr.stepsDone;
     }
 }
-
 static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult& cr, int outW, int outH) {
     double mv = 0;
     int intra = 0;
@@ -1031,6 +1170,8 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
     OfxRectI rw{};
     gProp->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &rw.x1);
+    double scale[2] = {1.0, 1.0};
+    gProp->propGetDoubleN(inArgs, kOfxImageEffectPropRenderScale, 2, scale);
 
     OfxImageClipHandle src = nullptr, outClip = nullptr;
     gEffect->clipGetHandle(inst, kOfxImageEffectSimpleSourceClipName, &src, nullptr);
@@ -1039,77 +1180,105 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
 
     HostImage out;
     if (!out.fetch(outClip, t)) return kOfxStatFailed;
+    // Every frame is converted to the output's pixel rectangle.
+    const OfxRectI R = out.b;
 
     Instance* cache = instanceData(inst);
     Plan pl = makePlan(inst, t);
-    if (!pl.cutKnown) detectCut(src, cache, pl);
+    // Proxy / draft renders: keep blocks and vectors the same size relative
+    // to the picture.
+    if (scale[0] > 0.0 && std::fabs(scale[0] - 1.0) > 1e-6) {
+        pl.s.block = std::max(4, (int)std::lround(pl.s.block * scale[0]));
+        pl.s.range = std::max(2, (int)std::lround(pl.s.range * scale[0]));
+    }
+
+    const mosh::ParallelFor pf = hostParallelFor;
+    FrameSource fs;
+    fs.clip = src;
+    fs.rect = R;
+    fs.pf = pf;
+    fs.tCur = t;
+    fs.cur = fetchFrame(src, t, R, pf);
+    if (!fs.cur) return kOfxStatFailed;
+    if (cache) {
+        fs.tPrev = t - 1.0;
+        fs.prev = cache->getFrame(t - 1.0, R);
+        cache->putFrame(t, R, fs.cur);
+    }
+
+    if (!pl.cutKnown) detectCut(src, cache, pl, R, fs.cur, fs.prev);
 
     const Settings& s = pl.s;
-    const mosh::ParallelFor pf = hostParallelFor;
-    mosh::Image result;
 
     if (s.view == 0 && pl.passThrough) {
-        if (!fetchAsImage(src, t, result)) return kOfxStatFailed;
-        out.fromImage(result, rw);
+        out.fromImage(*fs.cur, R, rw, pf);
         return kOfxStatOK;
     }
 
     mosh::Image acc;
     ChainResult cr;
+    const bool unstrided = pl.steps == pl.nFrames;
+    uint64_t hash = 0;
     if (!pl.passThrough) {
-        const uint64_t hash = chainHash(s);
+        hash = chainHash(s, R);
         // Fast path: the previous frame's accumulated picture is cached and the
         // chain is unstrided, so one more step gives exactly the same result.
-        const bool unstrided = pl.steps == pl.nFrames;
         if (unstrided && pl.nFrames >= 1 && cache && cache->getAcc(t - 1.0, pl.cutFrame, hash, acc, cr.refreshed)) {
             cr.fromCache = true;
-            runSteps(inst, src, pl, {t - 1.0, t}, acc, cr, pf);
+            runSteps(inst, fs, pl, {t - 1.0, t}, acc, cr, pf);
         } else {
             // Reference picture: the last frame before the cut, the one the decoder is stuck with.
-            if (!fetchAsImage(src, pl.cutFrame - 1.0, acc) && !fetchAsImage(src, t, acc)) return kOfxStatFailed;
-            runSteps(inst, src, pl, pl.times, acc, cr, pf);
+            FramePtr ref = fs.get(pl.cutFrame - 1.0);
+            acc = ref ? *ref : *fs.cur;
+            runSteps(inst, fs, pl, pl.times, acc, cr, pf);
         }
-        if (cache && unstrided) cache->putAcc(t, pl.cutFrame, hash, acc, cr.refreshed);
-    } else if (!fetchAsImage(src, t, acc)) {
-        return kOfxStatFailed;
+    } else {
+        acc = *fs.cur;
     }
+    // An aborted chain is incomplete and must not seed later frames.
+    const bool store = cache && unstrided && !pl.passThrough && !cr.aborted;
 
     if (s.view == 1) {
         if (cr.lastField.bw == 0) {
-            mosh::Image a, b;
-            if (fetchAsImage(src, t - 1.0, a) && fetchAsImage(src, t, b)) {
-                cr.lastField = mosh::estimateMotion(a, b, motionParams(s), pf);
-                cr.firstPairDiff = meanAbsDiff(a, b);
+            if (FramePtr a = fs.get(t - 1.0)) {
+                cr.lastField = mosh::estimateMotion(*a, *fs.cur, motionParams(s), pf);
+                cr.firstPairDiff = meanAbsDiff(*a, *fs.cur);
             }
         }
         if (cr.lastField.bw > 0) {
-            mosh::visualizeMotion(cr.lastField, s.range, acc.w, acc.h, result, pf);
-            out.fromImage(result, rw);
+            const int w = acc.w, h = acc.h;
+            if (store) cache->putAcc(t, pl.cutFrame, hash, std::move(acc), cr.refreshed);
+            mosh::Image vis;
+            mosh::visualizeMotion(cr.lastField, s.range, w, h, vis, pf);
+            out.fromImage(vis, R, rw, pf);
             return kOfxStatOK;
         }
     }
 
-    if (!pl.passThrough && pl.q > 0.f) {
-        mosh::Image to;
-        if (!fetchAsImage(src, t, to)) return kOfxStatFailed;
+    mosh::Image result;
+    const auto mode = (mosh::Recovery)s.recoverMode;
+    // These modes recover inside the chain; compose only matters at the very end.
+    const bool inChain = mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural;
+    if (!pl.passThrough && pl.q > 0.f && !(inChain && pl.q < 1.f)) {
         mosh::ComposeParams cp;
-        cp.mode = (mosh::Recovery)s.recoverMode;
+        cp.mode = mode;
         cp.softness = s.recoverSoftness;
         cp.block = s.block;
         cp.seed = s.seed;
         cp.invertReveal = s.revealInvert;
         cp.direction = (mosh::Direction)s.direction;
-        mosh::compose(acc, to, cp, pl.q, result, pf);
+        mosh::compose(acc, *fs.cur, cp, pl.q, result, pf);
+        if (store) cache->putAcc(t, pl.cutFrame, hash, std::move(acc), cr.refreshed);
     } else {
+        if (store) cache->putAcc(t, pl.cutFrame, hash, acc, cr.refreshed);
         result = std::move(acc);
     }
 
     if (s.view == 2) drawDiagnostics(result, pl, cr, out.width(), out.height());
 
-    out.fromImage(result, rw);
+    out.fromImage(result, R, rw, pf);
     return kOfxStatOK;
 }
-
 static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle inArgs,
                            OfxPropertySetHandle outArgs) {
     OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;

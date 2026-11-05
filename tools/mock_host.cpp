@@ -5,17 +5,21 @@
 // Images are handed to the plugin bottom-up, like real OFX hosts do.
 #include <dlfcn.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
+#include "ofxMultiThread.h"
 #include "ofxParam.h"
 #include "ofxProperty.h"
 
@@ -86,6 +90,8 @@ struct ParamSet {
     std::map<std::string, std::unique_ptr<Param>> params;
 };
 static double gT0 = 1000.0, gDur = 35.0;  // transition timing on the mock timeline
+static double gScale = 1.0;            // MOCK_SCALE
+static int gPad = 0, gOffX = 0, gOffY = 0;  // MOCK_PAD, MOCK_OFFSET (pixel origin of every image)
 
 static OfxStatus paramDefine(OfxParamSetHandle ps, const char* type, const char* name, OfxPropertySetHandle* props) {
     auto* set = reinterpret_cast<ParamSet*>(ps);
@@ -192,17 +198,28 @@ static OfxStatus clipGetImage(OfxImageClipHandle ch, OfxTime t, const OfxRectD*,
     Clip* c = reinterpret_cast<Clip*>(ch);
     c->requested.push_back(t);
     auto live = std::make_unique<Clip::Live>();
-    live->data.resize((size_t)c->w * c->h * 4, 0.f);
+    // MOCK_SCALE: images at a render scale (nearest-neighbour downsample).
+    // MOCK_PAD: source images carry an extra border of garbage around the
+    // output's rectangle, so their bounds differ from the output's.
+    const int sw = std::max(1, (int)std::lround(c->w * gScale)), sh = std::max(1, (int)std::lround(c->h * gScale));
+    const int pad = c->frames.empty() ? 0 : gPad;
+    const int bw = sw + 2 * pad, bh = sh + 2 * pad;
+    live->data.assign((size_t)bw * bh * 4, 0.37f);
     if (!c->frames.empty()) {
         int idx = (int)std::lround(t - gT0);
         idx = std::min(std::max(idx, 0), (int)c->frames.size() - 1);
-        live->data = c->frames[idx].rgba;
+        const std::vector<float>& f = c->frames[idx].rgba;
+        for (int y = 0; y < sh; ++y)
+            for (int x = 0; x < sw; ++x) {
+                const int fx = std::min(c->w - 1, (int)(x / gScale)), fy = std::min(c->h - 1, (int)(y / gScale));
+                memcpy(&live->data[((size_t)(y + pad) * bw + x + pad) * 4], &f[((size_t)fy * c->w + fx) * 4], 4 * sizeof(float));
+            }
     }
     PropSet& p = live->props;
     p.p[kOfxImagePropData] = {live->data.data()};
-    p.i[kOfxImagePropBounds] = {0, 0, c->w, c->h};
-    p.i[kOfxImagePropRegionOfDefinition] = {0, 0, c->w, c->h};
-    p.i[kOfxImagePropRowBytes] = {c->w * 4 * (int)sizeof(float)};
+    p.i[kOfxImagePropBounds] = {gOffX - pad, gOffY - pad, gOffX + sw + pad, gOffY + sh + pad};
+    p.i[kOfxImagePropRegionOfDefinition] = p.i[kOfxImagePropBounds];
+    p.i[kOfxImagePropRowBytes] = {bw * 4 * (int)sizeof(float)};
     p.s[kOfxImageEffectPropComponents] = {kOfxImageComponentRGBA};
     p.s[kOfxImageEffectPropPixelDepth] = {kOfxBitDepthFloat};
     p.d[kOfxImagePropPixelAspectRatio] = {1.0};
@@ -227,12 +244,33 @@ static OfxImageEffectSuiteV1 gEffectSuite = {
     clipGetRoD, abortFn, memAlloc, memFree, memLock, memUnlock,
 };
 
+// Optional multithread suite (MOCK_THREADS=n) so the plugin's parallel paths run as in a real host.
+static unsigned gThreads = 0;
+static OfxStatus mtMultiThread(OfxThreadFunctionV1 func, unsigned int n, void* arg) {
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < n; ++i) th.emplace_back([=] { func(i, n, arg); });
+    for (auto& t : th) t.join();
+    return kOfxStatOK;
+}
+static OfxStatus mtNumCPUs(unsigned int* n) { *n = gThreads; return kOfxStatOK; }
+static OfxStatus mtIndex(unsigned int* i) { *i = 0; return kOfxStatOK; }
+static int mtIsSpawned(void) { return 0; }
+static OfxStatus mtMutexCreate(OfxMutexHandle* m, int) { *m = reinterpret_cast<OfxMutexHandle>(new std::recursive_mutex); return kOfxStatOK; }
+static OfxStatus mtMutexDestroy(const OfxMutexHandle m) { delete reinterpret_cast<std::recursive_mutex*>(m); return kOfxStatOK; }
+static OfxStatus mtMutexLock(const OfxMutexHandle m) { reinterpret_cast<std::recursive_mutex*>(m)->lock(); return kOfxStatOK; }
+static OfxStatus mtMutexUnLock(const OfxMutexHandle m) { reinterpret_cast<std::recursive_mutex*>(m)->unlock(); return kOfxStatOK; }
+static OfxStatus mtMutexTryLock(const OfxMutexHandle m) { return reinterpret_cast<std::recursive_mutex*>(m)->try_lock() ? kOfxStatOK : kOfxStatFailed; }
+static OfxMultiThreadSuiteV1 gThreadSuite = {
+    mtMultiThread, mtNumCPUs, mtIndex, mtIsSpawned, mtMutexCreate, mtMutexDestroy, mtMutexLock, mtMutexUnLock, mtMutexTryLock,
+};
+
 static PropSet gHostProps;
 static const void* fetchSuite(OfxPropertySetHandle, const char* name, int ver) {
     if (!strcmp(name, kOfxPropertySuite) && ver == 1) return &gPropSuite;
     if (!strcmp(name, kOfxParameterSuite) && ver == 1) return &gParamSuite;
     if (!strcmp(name, kOfxImageEffectSuite) && ver == 1) return &gEffectSuite;
-    return nullptr;  // no multithread suite: plugin must fall back to serial
+    if (!strcmp(name, kOfxMultiThreadSuite) && ver == 1 && gThreads > 0) return &gThreadSuite;
+    return nullptr;  // without MOCK_THREADS the plugin must fall back to serial
 }
 
 static bool readClip(const char* path, int w, int h, int n, Clip& c) {
@@ -286,7 +324,12 @@ int main(int argc, char** argv) {
     OfxPlugin* pl = getPlugin(0);
     printf("id: %s v%d.%d api %s/%d\n", pl->pluginIdentifier, pl->pluginVersionMajor, pl->pluginVersionMinor, pl->pluginApi, pl->apiVersion);
 
+    if (const char* th = getenv("MOCK_THREADS")) gThreads = (unsigned)atoi(th);
+    if (const char* e = getenv("MOCK_SCALE")) gScale = atof(e);
+    if (const char* e = getenv("MOCK_PAD")) gPad = atoi(e);
+    if (const char* e = getenv("MOCK_OFFSET")) gOffX = gOffY = atoi(e);
     gHostProps.s[kOfxPropName] = {"mock.host"};
+    gHostProps.i[kOfxImageEffectPropTemporalClipAccess] = {getenv("MOCK_NO_TEMPORAL") ? 0 : 1};
     OfxHost host{H(&gHostProps), fetchSuite};
     pl->setHost(&host);
     CHECK(pl->mainEntry(kOfxActionLoad, nullptr, nullptr, nullptr), "load");
@@ -393,12 +436,15 @@ int main(int argc, char** argv) {
 
     FILE* fo = fopen(argv[7], "wb");
     if (!fo) return 1;
+    double renderMs = 0;
+    int renders = 0;
     for (int i = 0; i < total; ++i) {
         const double t = gT0 + i;
         PropSet inArgs, outArgs;
         inArgs.d[kOfxPropTime] = {t};
-        inArgs.i[kOfxImageEffectPropRenderWindow] = {0, 0, w, h};
-        inArgs.d[kOfxImageEffectPropRenderScale] = {1.0, 1.0};
+        const int sw = std::max(1, (int)std::lround(w * gScale)), sh = std::max(1, (int)std::lround(h * gScale));
+        inArgs.i[kOfxImageEffectPropRenderWindow] = {gOffX, gOffY, gOffX + sw, gOffY + sh};
+        inArgs.d[kOfxImageEffectPropRenderScale] = {gScale, gScale};
         inArgs.i[kOfxPropIsInteractive] = {0};
 
         CHECK(pl->mainEntry(kOfxImageEffectActionGetFramesNeeded, &inst, H(&inArgs), H(&outArgs)), "getFramesNeeded");
@@ -424,9 +470,22 @@ int main(int argc, char** argv) {
         from->requested.clear(); to->requested.clear(); out->live.clear();
         if (getenv("MOCK_PURGE"))  // render every frame from a cold cache, like scrubbing
             CHECK(pl->mainEntry(kOfxActionPurgeCaches, &inst, nullptr, nullptr), "purgeCaches");
+        const auto r0 = std::chrono::steady_clock::now();
         CHECK(pl->mainEntry(kOfxImageEffectActionRender, &inst, H(&inArgs), nullptr), "render");
+        renderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+        ++renders;
         if (out->live.empty()) { fprintf(stderr, "render did not fetch output image\n"); return 1; }
-        toRgb(out->live.back()->data);
+        if (gScale != 1.0) {  // nearest-neighbour back to full size
+            const int sw = std::max(1, (int)std::lround(w * gScale)), sh = std::max(1, (int)std::lround(h * gScale));
+            const std::vector<float>& s = out->live.back()->data;
+            std::vector<float> up((size_t)w * h * 4);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    memcpy(&up[((size_t)y * w + x) * 4], &s[((size_t)std::min(sh - 1, (int)(y * gScale)) * sw + std::min(sw - 1, (int)(x * gScale))) * 4], 4 * sizeof(float));
+            toRgb(up);
+        } else {
+            toRgb(out->live.back()->data);
+        }
         fwrite(rgbOut.data(), 1, rgbOut.size(), fo);
         if (i == 1 || i == total / 2) {
             printf("frame %d: fetched From at", i); for (double x : from->requested) printf(" %.0f", x);
@@ -435,6 +494,7 @@ int main(int argc, char** argv) {
         from->live.clear(); to->live.clear();
     }
     fclose(fo);
+    printf("render: %d calls, %.0f ms total, %.1f ms avg\n", renders, renderMs, renders ? renderMs / renders : 0.0);
     CHECK(pl->mainEntry(kOfxActionDestroyInstance, &inst, nullptr, nullptr), "destroy");
     CHECK(pl->mainEntry(kOfxActionUnload, nullptr, nullptr, nullptr), "unload");
     printf("done\n");
