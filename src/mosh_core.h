@@ -14,6 +14,15 @@
 #include <functional>
 #include <vector>
 
+// SSE2 is part of every x86-64 CPU. MOSH_NO_SIMD builds the plain loops, which
+// give the same results.
+#if !defined(MOSH_NO_SIMD) && (defined(__SSE2__) || defined(_M_X64))
+#include <emmintrin.h>
+#define MOSH_SSE 1
+#else
+#define MOSH_SSE 0
+#endif
+
 namespace mosh {
 
 struct Image {
@@ -170,106 +179,193 @@ inline float bilinearLuma(const Luma& L, float x, float y) {
 // then +-2 steps of refinement at every finer level down to full resolution.
 // Each block is matched on a window of at least 4x4 samples at every level, so
 // small blocks still get a meaningful match at coarse levels.
-inline MotionField estimateMotion(const Image& prev, const Image& cur, const MotionParams& mp,
-                                  const ParallelFor& pf) {
+//
+// The work is split into stages so a GPU can run the per-pixel ones while the
+// per-block decisions stay in one place (here):
+//   newField, pyramidLevels      sizes
+//   searchLevel (per level)      pixels: block search
+//   flatBlocks                   pixels: which blocks are textureless
+//   postProcessField             blocks: median smoothing, flat fill, intra threshold
+//   refineField                  pixels: half-pel refinement, block statistics
+//   finishIntra                  blocks: encoder intra decision
+inline MotionField newField(int w, int h, const MotionParams& mp) {
     MotionField mf;
     mf.block = std::max(4, mp.block);
-    mf.bw = (cur.w + mf.block - 1) / mf.block;
-    mf.bh = (cur.h + mf.block - 1) / mf.block;
+    mf.bw = (w + mf.block - 1) / mf.block;
+    mf.bh = (h + mf.block - 1) / mf.block;
     const size_t nb = (size_t)mf.bw * mf.bh;
     mf.dx.assign(nb, 0);
     mf.dy.assign(nb, 0);
     mf.err.assign(nb, 0.f);
     mf.intra.assign(nb, 0);
+    return mf;
+}
 
+inline int pyramidLevels(int w, int h) {
     int levels = 1;
-    while (levels < 4 && (std::min(cur.w, cur.h) >> levels) >= 32) ++levels;
-    const std::vector<Luma> Pp = buildPyramid(prev, levels, pf);
-    const std::vector<Luma> Pc = buildPyramid(cur, levels, pf);
+    while (levels < 4 && (std::min(w, h) >> levels) >= 32) ++levels;
+    return levels;
+}
 
-    const float lambda = 0.0008f;  // per px of vector length, in mean-abs-diff units
+static const float kMotionLambda = 0.0008f;  // per px of vector length, in mean-abs-diff units
 
-    for (int lvl = levels - 1; lvl >= 0; --lvl) {
-        const int d = 1 << lvl;
-        const Luma& Lp = Pp[lvl];
-        const Luma& Lc = Pc[lvl];
-        const int ws = std::max(4, mf.block / d);  // match window at this level
-        const int half = ws / 2;
-        const bool coarsest = (lvl == levels - 1);
-        const int r = coarsest ? std::max(2, (mp.range + d - 1) / d) : 2;
-        const float norm = 1.f / float(ws * ws);
+// Search radius and match window at pyramid level lvl (of levels).
+inline int searchRadius(const MotionParams& mp, int lvl, int levels) {
+    const int d = 1 << lvl;
+    return lvl == levels - 1 ? std::max(2, (mp.range + d - 1) / d) : 2;
+}
+inline int searchWindow(const MotionField& mf, int lvl) { return std::max(4, mf.block / (1 << lvl)); }
 
-        pf(mf.bh, [&](int b0, int b1) {
-            for (int by = b0; by < b1; ++by) {
-                for (int bx = 0; bx < mf.bw; ++bx) {
-                    const int i = mf.index(bx, by);
-                    // window centre in this level's coordinates
-                    const int cx = ((bx * mf.block + mf.block / 2) / d) - half;
-                    const int cy = ((by * mf.block + mf.block / 2) / d) - half;
-                    const int pdx = mf.dx[i] / d, pdy = mf.dy[i] / d;  // parent vector at this level
+// One level of the search; mf.dx/dy hold the parent level's vectors (in
+// full-res pixels) on entry and this level's on return.
+inline void searchLevel(const Luma& Lp, const Luma& Lc, int lvl, int levels, const MotionParams& mp, MotionField& mf,
+                        const ParallelFor& pf) {
+    const int d = 1 << lvl;
+    const int ws = searchWindow(mf, lvl);
+    const int half = ws / 2;
+    const int r = searchRadius(mp, lvl, levels);
+    const float norm = 1.f / float(ws * ws);
+    const float lambda = kMotionLambda;
 
-                    const bool curInside = cx >= 0 && cy >= 0 && cx + ws <= Lc.w && cy + ws <= Lc.h;
-                    // Sum of |cur - prev| over the window. With a bound, gives up as soon as the
-                    // partial cost reaches it: partial sums of non-negative terms only grow, so
-                    // such a candidate could never win and the result is the same.
-                    auto sad = [&](int vx, int vy, float bound, int pen, bool& over) {
-                        float s = 0.f;
-                        over = false;
-                        const bool inside = curInside && cx + vx >= 0 && cy + vy >= 0 && cx + vx + ws <= Lp.w &&
-                                            cy + vy + ws <= Lp.h;
-                        for (int yy = 0; yy < ws; ++yy) {
-                            if (inside) {
+    pf(mf.bh, [&](int b0, int b1) {
+        for (int by = b0; by < b1; ++by) {
+            for (int bx = 0; bx < mf.bw; ++bx) {
+                const int i = mf.index(bx, by);
+                // window centre in this level's coordinates
+                const int cx = ((bx * mf.block + mf.block / 2) / d) - half;
+                const int cy = ((by * mf.block + mf.block / 2) / d) - half;
+                const int pdx = mf.dx[i] / d, pdy = mf.dy[i] / d;  // parent vector at this level
+
+                const bool curInside = cx >= 0 && cy >= 0 && cx + ws <= Lc.w && cy + ws <= Lc.h;
+                // Sum of |cur - prev| over the window. With a bound, gives up as soon as the
+                // partial cost reaches it: partial sums of non-negative terms only grow, so
+                // such a candidate could never win and the result is the same.
+                auto sad = [&](int vx, int vy, float bound, int pen, bool& over) {
+                    float s = 0.f;
+                    over = false;
+                    const bool inside = curInside && cx + vx >= 0 && cy + vy >= 0 && cx + vx + ws <= Lp.w &&
+                                        cy + vy + ws <= Lp.h;
+                    for (int yy = 0; yy < ws; ++yy) {
+                        if (inside) {
+                            const float* pc = &Lc.v[(size_t)(cy + yy) * Lc.w + cx];
+                            const float* pp = &Lp.v[(size_t)(cy + yy + vy) * Lp.w + cx + vx];
+                            for (int xx = 0; xx < ws; ++xx) s += std::fabs(pc[xx] - pp[xx]);
+                        } else {
+                            for (int xx = 0; xx < ws; ++xx)
+                                s += std::fabs(Lc.at(cx + xx, cy + yy) - Lp.at(cx + xx + vx, cy + yy + vy));
+                        }
+                        if (pen >= 0 && s * norm + lambda * float(pen) * float(d) >= bound) {
+                            over = true;
+                            return s;
+                        }
+                    }
+                    return s;
+                };
+                auto mad = [&](int vx, int vy) {
+                    bool over;
+                    return sad(vx, vy, 0.f, -1, over) * norm;
+                };
+                auto cost = [&](int vx, int vy, float m) {
+                    return m + lambda * float(std::abs(vx) + std::abs(vy)) * float(d);
+                };
+
+                int bvx = pdx, bvy = pdy;
+                float bm = mad(pdx, pdy);
+                float bc = cost(pdx, pdy, bm);
+                if (pdx != 0 || pdy != 0) {  // zero vector is always a candidate
+                    const float m0 = mad(0, 0);
+                    const float c0 = cost(0, 0, m0);
+                    if (c0 < bc) { bc = c0; bm = m0; bvx = 0; bvy = 0; }
+                }
+                auto consider = [&](int vx, int vy, float sum) {
+                    const float m = sum * norm;
+                    const float c = cost(vx, vy, m);
+                    if (c < bc) { bc = c; bm = m; bvx = vx; bvy = vy; }
+                };
+                if (bm > 0.004f) {
+                    for (int vy = pdy - r; vy <= pdy + r; ++vy) {
+                        int vx = pdx - r;
+#if MOSH_SSE
+                        // Four horizontally adjacent candidates at once, one per lane. Every lane
+                        // adds the same terms in the same order as the scalar loop, so its sums are
+                        // identical. The batch gives up on a lane against the best cost from before
+                        // the batch; that bound is never lower than the one the scalar loop would
+                        // use, and a lane that would have been given up there cannot beat the best
+                        // cost by the time it is considered, so the result is the same.
+                        for (; vx + 3 <= pdx + r; vx += 4) {
+                            if (!(curInside && cx + vx >= 0 && cy + vy >= 0 && cx + vx + 3 + ws <= Lp.w &&
+                                  cy + vy + ws <= Lp.h)) {
+                                for (int k = 0; k < 4; ++k) {
+                                    if (vx + k == pdx && vy == pdy) continue;
+                                    bool over;
+                                    const float sum = sad(vx + k, vy, bc, std::abs(vx + k) + std::abs(vy), over);
+                                    if (!over) consider(vx + k, vy, sum);
+                                }
+                                continue;
+                            }
+                            alignas(16) float pt[4];
+                            for (int k = 0; k < 4; ++k) pt[k] = lambda * float(std::abs(vx + k) + std::abs(vy)) * float(d);
+                            const __m128 vpt = _mm_load_ps(pt), vnorm = _mm_set1_ps(norm), vbound = _mm_set1_ps(bc);
+                            const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+                            __m128 s = _mm_setzero_ps(), over = _mm_setzero_ps();
+                            for (int yy = 0; yy < ws; ++yy) {
                                 const float* pc = &Lc.v[(size_t)(cy + yy) * Lc.w + cx];
                                 const float* pp = &Lp.v[(size_t)(cy + yy + vy) * Lp.w + cx + vx];
-                                for (int xx = 0; xx < ws; ++xx) s += std::fabs(pc[xx] - pp[xx]);
-                            } else {
                                 for (int xx = 0; xx < ws; ++xx)
-                                    s += std::fabs(Lc.at(cx + xx, cy + yy) - Lp.at(cx + xx + vx, cy + yy + vy));
+                                    s = _mm_add_ps(s, _mm_and_ps(_mm_sub_ps(_mm_set1_ps(pc[xx]), _mm_loadu_ps(pp + xx)), absMask));
+                                over = _mm_or_ps(over, _mm_cmpge_ps(_mm_add_ps(_mm_mul_ps(s, vnorm), vpt), vbound));
+                                if (_mm_movemask_ps(over) == 15) break;
                             }
-                            if (pen >= 0 && s * norm + lambda * float(pen) * float(d) >= bound) {
-                                over = true;
-                                return s;
-                            }
-                        }
-                        return s;
-                    };
-                    auto mad = [&](int vx, int vy) {
-                        bool over;
-                        return sad(vx, vy, 0.f, -1, over) * norm;
-                    };
-                    auto cost = [&](int vx, int vy, float m) {
-                        return m + lambda * float(std::abs(vx) + std::abs(vy)) * float(d);
-                    };
-
-                    int bvx = pdx, bvy = pdy;
-                    float bm = mad(pdx, pdy);
-                    float bc = cost(pdx, pdy, bm);
-                    if (pdx != 0 || pdy != 0) {  // zero vector is always a candidate
-                        const float m0 = mad(0, 0);
-                        const float c0 = cost(0, 0, m0);
-                        if (c0 < bc) { bc = c0; bm = m0; bvx = 0; bvy = 0; }
-                    }
-                    if (bm > 0.004f) {
-                        for (int vy = pdy - r; vy <= pdy + r; ++vy) {
-                            for (int vx = pdx - r; vx <= pdx + r; ++vx) {
-                                if (vx == pdx && vy == pdy) continue;
-                                bool over;
-                                const float sum = sad(vx, vy, bc, std::abs(vx) + std::abs(vy), over);
-                                if (over) continue;
-                                const float m = sum * norm;
-                                const float c = cost(vx, vy, m);
-                                if (c < bc) { bc = c; bm = m; bvx = vx; bvy = vy; }
+                            alignas(16) float sums[4];
+                            _mm_store_ps(sums, s);
+                            const int om = _mm_movemask_ps(over);
+                            for (int k = 0; k < 4; ++k) {
+                                if ((vx + k == pdx && vy == pdy) || (om >> k & 1)) continue;
+                                consider(vx + k, vy, sums[k]);
                             }
                         }
+#endif
+                        for (; vx <= pdx + r; ++vx) {
+                            if (vx == pdx && vy == pdy) continue;
+                            bool over;
+                            const float sum = sad(vx, vy, bc, std::abs(vx) + std::abs(vy), over);
+                            if (!over) consider(vx, vy, sum);
+                        }
                     }
-                    mf.dx[i] = bvx * d;
-                    mf.dy[i] = bvy * d;
-                    mf.err[i] = bm;
                 }
+                mf.dx[i] = bvx * d;
+                mf.dy[i] = bvy * d;
+                mf.err[i] = bm;
             }
-        });
-    }
+        }
+    });
+}
 
+// Blocks whose full-res luma spread is below mp.flatThreshold.
+inline std::vector<uint8_t> flatBlocks(const Luma& L0, const MotionField& mf, const MotionParams& mp,
+                                       const ParallelFor& pf) {
+    std::vector<uint8_t> flat((size_t)mf.bw * mf.bh, 0);
+    pf(mf.bh, [&](int b0, int b1) {
+        for (int by = b0; by < b1; ++by)
+            for (int bx = 0; bx < mf.bw; ++bx) {
+                float mn = 1e9f, mx = -1e9f;
+                for (int yy = 0; yy < mf.block; ++yy)
+                    for (int xx = 0; xx < mf.block; ++xx) {
+                        const float v = L0.at(bx * mf.block + xx, by * mf.block + yy);
+                        mn = std::min(mn, v);
+                        mx = std::max(mx, v);
+                    }
+                flat[mf.index(bx, by)] = (mx - mn) < mp.flatThreshold ? 1 : 0;
+            }
+    });
+    return flat;
+}
+
+// Median smoothing, flat fill (flat from flatBlocks, may be empty when
+// mp.fillFlat is off) and the intra threshold.
+inline void postProcessField(MotionField& mf, std::vector<uint8_t> flat, const MotionParams& mp,
+                             const ParallelFor& pf) {
+    const size_t nb = (size_t)mf.bw * mf.bh;
     if (mp.smooth && mf.bw >= 3 && mf.bh >= 3) {
         std::vector<int> sx(nb), sy(nb);
         pf(mf.bh, [&](int b0, int b1) {
@@ -295,22 +391,7 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
         mf.dy.swap(sy);
     }
 
-    if (mp.fillFlat) {
-        const Luma& L0 = Pc[0];
-        std::vector<uint8_t> flat(nb, 0);
-        pf(mf.bh, [&](int b0, int b1) {
-            for (int by = b0; by < b1; ++by)
-                for (int bx = 0; bx < mf.bw; ++bx) {
-                    float mn = 1e9f, mx = -1e9f;
-                    for (int yy = 0; yy < mf.block; ++yy)
-                        for (int xx = 0; xx < mf.block; ++xx) {
-                            const float v = L0.at(bx * mf.block + xx, by * mf.block + yy);
-                            mn = std::min(mn, v);
-                            mx = std::max(mx, v);
-                        }
-                    flat[mf.index(bx, by)] = (mx - mn) < mp.flatThreshold ? 1 : 0;
-                }
-        });
+    if (mp.fillFlat && flat.size() == nb) {
         // Grow vectors from textured blocks into flat ones, one ring per pass.
         std::vector<int> nx(nb), ny(nb);
         std::vector<uint8_t> nflat(nb);
@@ -349,110 +430,128 @@ inline MotionField estimateMotion(const Image& prev, const Image& cur, const Mot
 
     if (mp.intraThreshold < 1.f)
         for (size_t i = 0; i < nb; ++i) mf.intra[i] = mf.err[i] > mp.intraThreshold ? 1 : 0;
+}
 
-    if (mp.halfPel || mp.intraRate > 0.f || mp.blockStats) {
-        const Luma& Lp = Pp[0];
-        const Luma& Lc = Pc[0];
-        if (mp.halfPel) {
-            mf.fx.assign(nb, 0.f);
-            mf.fy.assign(nb, 0.f);
-        }
-        mf.sse.assign(nb, 0.f);
-        mf.var.assign(nb, 0.f);
-        // prev luma sampled at +0.5 px in x, y and both: every half-pel
-        // candidate then reads a plane instead of interpolating. Values are
-        // computed with bilinearLuma itself, so they are bit-identical.
-        std::vector<float> halfPlanes[3];
-        if (mp.halfPel) {
-            for (auto& hp : halfPlanes) hp.resize((size_t)Lp.w * Lp.h);
-            pf(Lp.h, [&](int y0, int y1) {
-                for (int y = y0; y < y1; ++y) {
-                    const size_t row = (size_t)y * Lp.w;
-                    for (int x = 0; x < Lp.w; ++x) {
-                        if (x + 1 < Lp.w && y + 1 < Lp.h) {
-                            const float* p = &Lp.v[row + x];
-                            const float a = p[0], b = p[1], c = p[Lp.w], d = p[Lp.w + 1];
-                            halfPlanes[0][row + x] = bilinearMix(a, b, c, d, 0.5f, 0.f);
-                            halfPlanes[1][row + x] = bilinearMix(a, b, c, d, 0.f, 0.5f);
-                            halfPlanes[2][row + x] = bilinearMix(a, b, c, d, 0.5f, 0.5f);
-                        } else {
-                            halfPlanes[0][row + x] = bilinearLuma(Lp, x + 0.5f, (float)y);
-                            halfPlanes[1][row + x] = bilinearLuma(Lp, (float)x, y + 0.5f);
-                            halfPlanes[2][row + x] = bilinearLuma(Lp, x + 0.5f, y + 0.5f);
-                        }
+inline bool needsRefine(const MotionParams& mp) { return mp.halfPel || mp.intraRate > 0.f || mp.blockStats; }
+
+// Half-pel refinement and per-block statistics (sse, var) on full-res luma.
+inline void refineField(const Luma& Lp, const Luma& Lc, int curW, int curH, const MotionParams& mp, MotionField& mf,
+                        const ParallelFor& pf) {
+    const size_t nb = (size_t)mf.bw * mf.bh;
+    if (mp.halfPel) {
+        mf.fx.assign(nb, 0.f);
+        mf.fy.assign(nb, 0.f);
+    }
+    mf.sse.assign(nb, 0.f);
+    mf.var.assign(nb, 0.f);
+    // prev luma sampled at +0.5 px in x, y and both: every half-pel
+    // candidate then reads a plane instead of interpolating. Values are
+    // computed with bilinearLuma itself, so they are bit-identical.
+    std::vector<float> halfPlanes[3];
+    if (mp.halfPel) {
+        for (auto& hp : halfPlanes) hp.resize((size_t)Lp.w * Lp.h);
+        pf(Lp.h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                const size_t row = (size_t)y * Lp.w;
+                for (int x = 0; x < Lp.w; ++x) {
+                    if (x + 1 < Lp.w && y + 1 < Lp.h) {
+                        const float* p = &Lp.v[row + x];
+                        const float a = p[0], b = p[1], c = p[Lp.w], d = p[Lp.w + 1];
+                        halfPlanes[0][row + x] = bilinearMix(a, b, c, d, 0.5f, 0.f);
+                        halfPlanes[1][row + x] = bilinearMix(a, b, c, d, 0.f, 0.5f);
+                        halfPlanes[2][row + x] = bilinearMix(a, b, c, d, 0.5f, 0.5f);
+                    } else {
+                        halfPlanes[0][row + x] = bilinearLuma(Lp, x + 0.5f, (float)y);
+                        halfPlanes[1][row + x] = bilinearLuma(Lp, (float)x, y + 0.5f);
+                        halfPlanes[2][row + x] = bilinearLuma(Lp, x + 0.5f, y + 0.5f);
                     }
                 }
-            });
-        }
-        pf(mf.bh, [&](int b0, int b1) {
-            for (int by = b0; by < b1; ++by)
-                for (int bx = 0; bx < mf.bw; ++bx) {
-                    const int i = mf.index(bx, by);
-                    const int x0 = bx * mf.block, y0 = by * mf.block;
-                    const int x1 = std::min(x0 + mf.block, cur.w), y1 = std::min(y0 + mf.block, cur.h);
-                    const float cnt = float((x1 - x0) * (y1 - y0));
-                    auto sseAt = [&](float vx, float vy) {
-                        float s = 0.f;
-                        // Split v into an integer offset and a half: x + v == (x + ix) + hx exactly.
-                        const int ix = (int)std::floor(vx), iy = (int)std::floor(vy);
-                        const bool hx = vx != (float)ix, hy = vy != (float)iy;
-                        const float* plane = !hx && !hy ? Lp.v.data()
-                                             : hx && !hy ? halfPlanes[0].data()
-                                             : !hx && hy ? halfPlanes[1].data()
-                                                         : halfPlanes[2].data();
-                        const bool fast = ((!hx && !hy) || mp.halfPel) && x0 + ix >= 0 && y0 + iy >= 0 &&
-                                          x1 + ix <= Lp.w && y1 + iy <= Lp.h && Lc.w == cur.w;
-                        for (int y = y0; y < y1; ++y) {
-                            const float* pc = &Lc.v[(size_t)y * Lc.w];
-                            if (fast) {
-                                const float* pp = plane + (size_t)(y + iy) * Lp.w + ix;
-                                for (int x = x0; x < x1; ++x) {
-                                    const float d = pc[x] - pp[x];
-                                    s += d * d;
-                                }
-                            } else {
-                                for (int x = x0; x < x1; ++x) {
-                                    const float d = pc[x] - bilinearLuma(Lp, x + vx, y + vy);
-                                    s += d * d;
-                                }
-                            }
-                        }
-                        return s / cnt;
-                    };
-                    float vx = (float)mf.dx[i], vy = (float)mf.dy[i];
-                    float best = sseAt(vx, vy);
-                    if (mp.halfPel) {
-                        const float cx = vx, cy = vy;
-                        for (int oy = -1; oy <= 1; ++oy)
-                            for (int ox = -1; ox <= 1; ++ox) {
-                                if (!ox && !oy) continue;
-                                const float e = sseAt(cx + 0.5f * ox, cy + 0.5f * oy);
-                                if (e < best) { best = e; vx = cx + 0.5f * ox; vy = cy + 0.5f * oy; }
-                            }
-                        mf.fx[i] = vx;
-                        mf.fy[i] = vy;
-                    }
-                    float m = 0.f, m2 = 0.f;
-                    for (int y = y0; y < y1; ++y)
-                        for (int x = x0; x < x1; ++x) {
-                            const float l = Lc.v[(size_t)y * Lc.w + x];
-                            m += l;
-                            m2 += l * l;
-                        }
-                    m /= cnt;
-                    mf.sse[i] = best;
-                    mf.var[i] = std::max(0.f, m2 / cnt - m * m);
-                }
+            }
         });
-        if (mp.intraRate > 0.f) {
-            const IntraRule r = intraRule(mp.intraRate);
-            for (size_t i = 0; i < nb; ++i)
-                if (mf.sse[i] > r.k * mf.var[i] + r.bias) mf.intra[i] = 1;
-        }
+    }
+    pf(mf.bh, [&](int b0, int b1) {
+        for (int by = b0; by < b1; ++by)
+            for (int bx = 0; bx < mf.bw; ++bx) {
+                const int i = mf.index(bx, by);
+                const int x0 = bx * mf.block, y0 = by * mf.block;
+                const int x1 = std::min(x0 + mf.block, curW), y1 = std::min(y0 + mf.block, curH);
+                const float cnt = float((x1 - x0) * (y1 - y0));
+                auto sseAt = [&](float vx, float vy) {
+                    float s = 0.f;
+                    // Split v into an integer offset and a half: x + v == (x + ix) + hx exactly.
+                    const int ix = (int)std::floor(vx), iy = (int)std::floor(vy);
+                    const bool hx = vx != (float)ix, hy = vy != (float)iy;
+                    const float* plane = !hx && !hy ? Lp.v.data()
+                                         : hx && !hy ? halfPlanes[0].data()
+                                         : !hx && hy ? halfPlanes[1].data()
+                                                     : halfPlanes[2].data();
+                    const bool fast = ((!hx && !hy) || mp.halfPel) && x0 + ix >= 0 && y0 + iy >= 0 &&
+                                      x1 + ix <= Lp.w && y1 + iy <= Lp.h && Lc.w == curW;
+                    for (int y = y0; y < y1; ++y) {
+                        const float* pc = &Lc.v[(size_t)y * Lc.w];
+                        if (fast) {
+                            const float* pp = plane + (size_t)(y + iy) * Lp.w + ix;
+                            for (int x = x0; x < x1; ++x) {
+                                const float d = pc[x] - pp[x];
+                                s += d * d;
+                            }
+                        } else {
+                            for (int x = x0; x < x1; ++x) {
+                                const float d = pc[x] - bilinearLuma(Lp, x + vx, y + vy);
+                                s += d * d;
+                            }
+                        }
+                    }
+                    return s / cnt;
+                };
+                float vx = (float)mf.dx[i], vy = (float)mf.dy[i];
+                float best = sseAt(vx, vy);
+                if (mp.halfPel) {
+                    const float cx = vx, cy = vy;
+                    for (int oy = -1; oy <= 1; ++oy)
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            if (!ox && !oy) continue;
+                            const float e = sseAt(cx + 0.5f * ox, cy + 0.5f * oy);
+                            if (e < best) { best = e; vx = cx + 0.5f * ox; vy = cy + 0.5f * oy; }
+                        }
+                    mf.fx[i] = vx;
+                    mf.fy[i] = vy;
+                }
+                float m = 0.f, m2 = 0.f;
+                for (int y = y0; y < y1; ++y)
+                    for (int x = x0; x < x1; ++x) {
+                        const float l = Lc.v[(size_t)y * Lc.w + x];
+                        m += l;
+                        m2 += l * l;
+                    }
+                m /= cnt;
+                mf.sse[i] = best;
+                mf.var[i] = std::max(0.f, m2 / cnt - m * m);
+            }
+    });
+}
+
+inline void finishIntra(MotionField& mf, const MotionParams& mp) {
+    if (!(mp.intraRate > 0.f) || mf.sse.size() != mf.intra.size()) return;
+    const IntraRule r = intraRule(mp.intraRate);
+    for (size_t i = 0; i < mf.intra.size(); ++i)
+        if (mf.sse[i] > r.k * mf.var[i] + r.bias) mf.intra[i] = 1;
+}
+
+inline MotionField estimateMotion(const Image& prev, const Image& cur, const MotionParams& mp,
+                                  const ParallelFor& pf) {
+    MotionField mf = newField(cur.w, cur.h, mp);
+    const int levels = pyramidLevels(cur.w, cur.h);
+    const std::vector<Luma> Pp = buildPyramid(prev, levels, pf);
+    const std::vector<Luma> Pc = buildPyramid(cur, levels, pf);
+    for (int lvl = levels - 1; lvl >= 0; --lvl) searchLevel(Pp[lvl], Pc[lvl], lvl, levels, mp, mf, pf);
+    postProcessField(mf, mp.fillFlat ? flatBlocks(Pc[0], mf, mp, pf) : std::vector<uint8_t>(), mp, pf);
+    if (needsRefine(mp)) {
+        refineField(Pp[0], Pc[0], cur.w, cur.h, mp, mf, pf);
+        finishIntra(mf, mp);
     }
     return mf;
 }
-
 struct StepParams {
     float motionScale = 1.f;   // multiply motion vectors
     float residual = 1.f;      // how much of the P-frame residual to add
@@ -474,6 +573,25 @@ inline void bilinear(const Image& im, float x, float y, float* o) {
     for (int k = 0; k < 4; ++k) o[k] = (a[k] + ax * (b[k] - a[k])) * (1.f - ay) + (c[k] + ax * (d[k] - c[k])) * ay;
 }
 
+#if MOSH_SSE
+inline __m128 bilinear4(const Image& im, float x, float y) {
+    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+    const float ax = x - (float)x0, ay = y - (float)y0;
+    const float *a, *b, *c, *d;
+    if (x0 >= 0 && y0 >= 0 && x0 + 1 < im.w && y0 + 1 < im.h) {
+        a = im.at(x0, y0); b = a + 4; c = a + (size_t)im.w * 4; d = c + 4;
+    } else {
+        a = im.clampedAt(x0, y0); b = im.clampedAt(x0 + 1, y0);
+        c = im.clampedAt(x0, y0 + 1); d = im.clampedAt(x0 + 1, y0 + 1);
+    }
+    const __m128 va = _mm_loadu_ps(a), vb = _mm_loadu_ps(b), vc = _mm_loadu_ps(c), vd = _mm_loadu_ps(d);
+    const __m128 vax = _mm_set1_ps(ax);
+    const __m128 top = _mm_add_ps(va, _mm_mul_ps(vax, _mm_sub_ps(vb, va)));
+    const __m128 bot = _mm_add_ps(vc, _mm_mul_ps(vax, _mm_sub_ps(vd, vc)));
+    return _mm_add_ps(_mm_mul_ps(top, _mm_set1_ps(1.f - ay)), _mm_mul_ps(bot, _mm_set1_ps(ay)));
+}
+#endif
+
 // One "P-frame decode" on the wrong reference:
 //   accOut(x) = accIn(x + mv) + residual * (cur(x) - prev(x + mv))
 inline void moshStepOnce(const Image& prev, const Image& cur, const MotionField& mf, const StepParams& sp,
@@ -491,6 +609,29 @@ inline void moshStepOnce(const Image& prev, const Image& cur, const MotionField&
                     o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = c[3];
                     continue;
                 }
+#if MOSH_SSE
+                // Same operations in the same order as below, one channel per lane.
+                {
+                    __m128 va, vp;
+                    if (mf.subpel()) {
+                        const float fx = x + mf.fx[i] * sp.motionScale, fy = y + mf.fy[i] * sp.motionScale;
+                        va = bilinear4(accIn, fx, fy);
+                        vp = bilinear4(prev, fx, fy);
+                    } else {
+                        const int dx = (int)std::lround(mf.dx[i] * sp.motionScale);
+                        const int dy = (int)std::lround(mf.dy[i] * sp.motionScale);
+                        va = _mm_loadu_ps(accIn.clampedAt(x + dx, y + dy));
+                        vp = _mm_loadu_ps(prev.clampedAt(x + dx, y + dy));
+                    }
+                    __m128 v = _mm_add_ps(va, _mm_mul_ps(_mm_set1_ps(sp.residual), _mm_sub_ps(_mm_loadu_ps(c), vp)));
+                    // max(0, v) and min(1, v) in this operand order match std::max(v, 0.f) and
+                    // std::min(v, 1.f), signed zeros and NaN included.
+                    if (sp.clampLevels) v = _mm_min_ps(_mm_set1_ps(1.f), _mm_max_ps(_mm_setzero_ps(), v));
+                    const __m128 rgb = _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1));
+                    _mm_storeu_ps(o, _mm_or_ps(_mm_and_ps(rgb, v), _mm_andnot_ps(rgb, va)));
+                    continue;
+                }
+#endif
                 float ia[4], ip[4];
                 const float* a;
                 const float* p;
