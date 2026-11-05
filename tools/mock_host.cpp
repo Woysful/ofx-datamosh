@@ -127,13 +127,20 @@ static OfxStatus paramGetValue(OfxParamHandle ph, ...) {
     return kOfxStatOK;
 }
 static OfxStatus unsupported(...) { return kOfxStatErrUnsupported; }
+static OfxStatus paramSetValue(OfxParamHandle ph, ...) {
+    Param* p = reinterpret_cast<Param*>(ph);
+    va_list ap; va_start(ap, ph);
+    if (p->type == kOfxParamTypeDouble) p->dval = va_arg(ap, double); else p->ival = va_arg(ap, int);
+    va_end(ap);
+    return kOfxStatOK;
+}
 
 static OfxParameterSuiteV1 gParamSuite = {
     paramDefine, paramGetHandle, paramSetGetPropertySet, paramGetPropertySet,
     paramGetValue, paramGetValueAtTime,
     (OfxStatus(*)(OfxParamHandle, OfxTime, ...))unsupported,            // derivative
     (OfxStatus(*)(OfxParamHandle, OfxTime, OfxTime, ...))unsupported,   // integral
-    (OfxStatus(*)(OfxParamHandle, ...))unsupported,                     // setValue
+    paramSetValue,                                                      // setValue
     (OfxStatus(*)(OfxParamHandle, OfxTime, ...))unsupported,            // setValueAtTime
     (OfxStatus(*)(OfxParamHandle, unsigned int*))unsupported,
     (OfxStatus(*)(OfxParamHandle, unsigned int, OfxTime*))unsupported,
@@ -364,6 +371,23 @@ int main(int argc, char** argv) {
         CHECK(pl->mainEntry(kOfxActionInstanceChanged, &inst, H(&ic), nullptr), "instanceChanged");
         printf("after cutMode=Manual, recoverMode=Luma reveal:\n");
         dump();
+        // Mosh Style switching: parameters at the old style's defaults follow.
+        auto& P = inst.params.params;
+        auto styleTo = [&](int v) {
+            P["moshStyle"]->ival = v;
+            PropSet sc;
+            sc.s[kOfxPropName] = {"moshStyle"};
+            sc.s[kOfxPropChangeReason] = {kOfxChangeUserEdited};
+            const OfxStatus st = pl->mainEntry(kOfxActionInstanceChanged, &inst, H(&sc), nullptr);
+            if (st != kOfxStatOK) printf("instanceChanged failed: %d\n", st);
+            printf("style=%d residual=%.2f recoverMode=%d intraRate.enabled=%d\n", v, P["residual"]->dval,
+                   P["recoverMode"]->ival, P["intraRate"]->props.i[kOfxParamPropEnabled][0]);
+        };
+        P["recoverMode"]->ival = 10;
+        styleTo(1);
+        styleTo(0);
+        P["residual"]->dval = 0.8;
+        styleTo(1);
         return 0;
     }
 

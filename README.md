@@ -200,6 +200,7 @@ Dark Areas First outside Luma reveal, and so on).
 
 | Parameter | Default | Meaning |
 |---|---|---|
+| Mosh Style | Natural | Natural: the new shot replaces the old picture from the first frame after the cut, as in a real stream. Classic: the old picture is smeared on its own until recovery starts (the behaviour before Natural existed). See below. |
 | Mosh Length | 30 | Frames after the cut the mosh lasts, recovery included. |
 | Residual Strength | 1.0 | 0 = pure smear of the old frame, 1 = codec-accurate, >1 overdrive. |
 | New Data Rate | 0.6 | How readily blocks of the new shot are coded intra (fresh) instead of predicted, from the first frame after the cut. 0 = never, about 0.5 behaves like Xvid, higher replaces the old picture faster. |
@@ -262,8 +263,20 @@ All modes except Natural start at Recovery Start. New Data Rate works in
 every mode, so the new shot starts coming in at the cut with any of them;
 set it to 0 for a pure smear until recovery.
 
-To get the 1.4 look back exactly: Recovery Block refresh, Softness 0, New
-Data Rate 0, Half-pixel Motion off, Residual Strength 0.6.
+To get the 1.4 look back exactly: Mosh Style Classic, Recovery Block
+refresh, Softness 0 (Residual Strength 0.6, which Classic sets).
+
+### Mosh styles
+
+| Style | What it does | Defaults it brings |
+|---|---|---|
+| Natural | Encoder-style intra decisions (New Data Rate) and half-pixel motion: fresh blocks of the new shot appear from the first frame after the cut and travel with the motion, so the two shots merge gradually. | Residual Strength 1.0, Recovery Natural |
+| Classic | No intra decisions besides Intra Threshold, whole-pixel motion: the old picture is smeared by the new shot's motion and the new shot comes back during recovery. New Data Rate and Half-pixel Motion are greyed out. | Residual Strength 0.6, Recovery Motion refresh |
+
+When you switch style, Residual Strength and Recovery move to the new
+style's defaults, but only if they were still at the old style's defaults;
+values you changed stay. Every Recovery mode, Natural included, works with
+both styles.
 
 Looks to start from:
 

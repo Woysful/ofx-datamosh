@@ -48,6 +48,7 @@ const char* kRepeat = "bloomRepeat";        // int: decode each P-frame N times
 const char* kIntra = "intraThreshold";      // double 0..1
 const char* kSmooth = "smoothVectors";      // bool
 const char* kFillFlat = "fillFlat";         // bool
+const char* kMoshStyle = "moshStyle";       // choice: Natural / Classic
 const char* kIntraRate = "intraRate";       // double 0..1: encoder-style intra decision
 const char* kSubpel = "halfPelMotion";      // bool
 const char* kRecoverStart = "recoverStart"; // double 0..1
@@ -69,6 +70,16 @@ const char* kGrpAdvanced = "grpAdvanced";
 }  // namespace P
 
 static const int kDefaultRecovery = (int)mosh::Recovery::Natural;
+static const int kStyleClassic = 1;
+
+struct StyleDefaults {
+    double residual;
+    int recovery;
+};
+static const StyleDefaults kStyleDefaults[2] = {
+    {1.0, (int)mosh::Recovery::Natural},        // Natural
+    {0.6, (int)mosh::Recovery::MotionRefresh},  // Classic
+};
 
 static const int kBlockSizes[] = {8, 16, 32, 64};
 
@@ -372,6 +383,10 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.fillFlat = getInt(ps, P::kFillFlat, t, 1) != 0;
     s.intraRate = (float)getDouble(ps, P::kIntraRate, t, 0.6);
     s.subpel = getInt(ps, P::kSubpel, t, 1) != 0;
+    if (getInt(ps, P::kMoshStyle, t, 0) == kStyleClassic) {
+        s.intraRate = 0.f;
+        s.subpel = false;
+    }
     s.recoverStart = getDouble(ps, P::kRecoverStart, t, 0.8);
     s.recoverMode = std::min(std::max(getInt(ps, P::kRecoverMode, t, kDefaultRecovery), 0),
                              mosh::kRecoveryCount - 1);
@@ -687,6 +702,13 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
                  0.12, 0.02, 1.0);
 
     beginGroup(ps, P::kGrpMosh, "Mosh", "How the old picture is dragged and smeared.", true);
+    defineChoice(ps, P::kMoshStyle, "Mosh Style",
+                 "Natural: the new shot replaces the old picture from the first frame after the cut, the way "
+                 "it does in a real stream with a deleted keyframe (encoder intra decisions, half-pixel motion). "
+                 "Classic: the old picture is smeared on its own until recovery starts, as in earlier versions. "
+                 "Switching also moves Residual Strength and Recovery to the style's defaults if they were left "
+                 "at the other style's defaults.",
+                 {"Natural", "Classic"}, 0);
     defineInt(ps, P::kMoshLength, "Mosh Length",
               "How many frames after the cut the mosh lasts (including recovery).", 30, 2, 600);
     defineDouble(ps, P::kResidual, "Residual Strength",
@@ -806,6 +828,38 @@ static void updateEnabled(OfxImageEffectHandle inst) {
                                  mode == mosh::Recovery::Natural || directional);
     setEnabled(ps, P::kRecoverCurve, mode != mosh::Recovery::HardCut);
     setEnabled(ps, P::kRecoverStart, mode != mosh::Recovery::Natural);
+    const bool classic = currentInt(ps, P::kMoshStyle, 0) == kStyleClassic;
+    setEnabled(ps, P::kIntraRate, !classic);
+    setEnabled(ps, P::kSubpel, !classic);
+}
+
+static double currentDouble(OfxParamSetHandle ps, const char* name, double fallback) {
+    OfxParamHandle h = nullptr;
+    if (gParam->paramGetHandle(ps, name, &h, nullptr) != kOfxStatOK || !h) return fallback;
+    double v = fallback;
+    gParam->paramGetValue(h, &v);
+    return v;
+}
+
+// Each style has its own defaults for Residual Strength and Recovery. When
+// the user switches style, parameters still at the old style's default
+// follow; anything the user changed is left alone.
+static void applyStyleDefaults(OfxImageEffectHandle inst) {
+    OfxParamSetHandle ps = nullptr;
+    gEffect->getParamSet(inst, &ps);
+    if (!ps) return;
+    const int style = currentInt(ps, P::kMoshStyle, 0);
+    const StyleDefaults& to = kStyleDefaults[style == kStyleClassic ? 1 : 0];
+    const StyleDefaults& from = kStyleDefaults[style == kStyleClassic ? 0 : 1];
+    OfxParamHandle h = nullptr;
+    gParam->paramEditBegin(ps, "Mosh Style");
+    if (std::fabs(currentDouble(ps, P::kResidual, from.residual) - from.residual) < 1e-6 &&
+        gParam->paramGetHandle(ps, P::kResidual, &h, nullptr) == kOfxStatOK && h)
+        gParam->paramSetValue(h, to.residual);
+    if (currentInt(ps, P::kRecoverMode, from.recovery) == from.recovery &&
+        gParam->paramGetHandle(ps, P::kRecoverMode, &h, nullptr) == kOfxStatOK && h)
+        gParam->paramSetValue(h, to.recovery);
+    gParam->paramEditEnd(ps);
 }
 static OfxStatus createInstance(OfxImageEffectHandle inst) {
     OfxPropertySetHandle props = nullptr;
@@ -1069,7 +1123,17 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
         if (!strcmp(action, kOfxActionInstanceChanged) || !strcmp(action, kOfxActionPurgeCaches) ||
             !strcmp(action, kOfxActionSyncPrivateData)) {
             if (Instance* d = instanceData(effect)) d->clear();
-            if (!strcmp(action, kOfxActionInstanceChanged)) updateEnabled(effect);
+            if (!strcmp(action, kOfxActionInstanceChanged)) {
+                char* name = nullptr;
+                char* reason = nullptr;
+                if (inArgs) {
+                    gProp->propGetString(inArgs, kOfxPropName, 0, &name);
+                    gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
+                }
+                if (name && reason && !strcmp(name, P::kMoshStyle) && !strcmp(reason, kOfxChangeUserEdited))
+                    applyStyleDefaults(effect);
+                updateEnabled(effect);
+            }
             return kOfxStatOK;
         }
         if (!strcmp(action, kOfxImageEffectActionGetClipPreferences)) return getClipPreferences(effect, outArgs);
