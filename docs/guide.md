@@ -99,7 +99,7 @@ intra refresh, Crossfade and IDR frame. The stored values did not change, so
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Max Motion Steps | 48 | Cap on frame pairs analysed per frame when the cache is cold. |
+| Checkpoint Memory (MB) | 1024 | RAM for checkpoints, pictures of the mosh saved every few frames so jumps and scrubbing continue from the nearest one. Shared by all Datamosh effects; 0 turns them off. Does not change the picture. See [Performance](#performance). |
 | Render Device | Auto | Where the mosh is computed: Auto (an NVIDIA GPU through CUDA, else another GPU through OpenCL, else the CPU), CPU, CUDA or OpenCL. The picture is the same on every device. See [Performance](#performance). |
 | View | Result | "Motion vectors" shows the field used for the frame (x -> red, y -> green, intra = white). "Diagnostics" overlays numbers. |
 
@@ -226,14 +226,30 @@ still or PowerGrade.
 
 The first frame after the cut is cheap; frame *k* of the mosh needs the
 motion of *k* frame pairs. The plugin caches the previous frame's result, so
-playing or rendering forward costs one motion step per frame. Scrubbing
-backwards or jumping into the middle of a mosh rebuilds the chain from the
-cut (bounded by **Max Motion Steps**). Each source frame is fetched from the
-host once per render and the frame before it is kept from the previous
-render, so in-order playback asks the host for one new frame per frame.
-Hosts that render several frames at the same time during playback, like
-Resolve, get the same: each frame waits for the one before it if that is
-still being rendered, and continues from it.
+playing or rendering forward costs one motion step per frame.
+
+While a mosh renders, the plugin also keeps a checkpoint (its picture so
+far) every few frames in RAM. Scrubbing backwards or jumping into a part of
+the mosh rendered before continues from the nearest checkpoint before the
+frame, a few steps instead of the whole chain. Jumping past everything
+rendered so far still runs the steps from the last checkpoint (or the cut)
+up to the frame. A 1080p checkpoint takes 33 MB, a UHD one 133 MB. They
+share **Checkpoint Memory** (1024 MB by default) across all Datamosh
+effects, at least 8 frames apart and further apart when a long mosh would
+not fit; when the memory is full, the least recently used go first.
+
+Every frame is computed from every frame pair since the cut, so a frame
+looks the same however you got to it. (Earlier versions had a Max Motion
+Steps cap that sampled long moshes at a coarser stride, which made such
+frames jitter; it is gone, and projects that set it load with the value
+ignored.)
+
+Each source frame is fetched from the host once per render and the frame
+before it is kept from the previous render, so in-order playback asks the
+host for one new frame per frame. Hosts that render several frames at the
+same time during playback, like Resolve, get the same: each frame waits for
+the one before it if that is still being rendered, and continues from it.
+
 **GPU.** With Render Device on Auto the motion search and the mosh steps run
 on the GPU when there is one: an NVIDIA card through CUDA, AMD, Intel or
 other cards through OpenCL. The GPU follows the CPU code operation for
@@ -254,7 +270,8 @@ Tips if it is still slow:
 
 * Block Size 32x32 is about 4x faster than 16x16 and looks chunkier, often
   better.
-* Lower Max Motion Steps (24) to bound the worst case when scrubbing.
+* For long moshes at UHD, raise Checkpoint Memory so the checkpoints sit
+  closer together and jumps take fewer steps.
 * In Resolve, render the clip in place (right-click > Render in Place) once
   you like it.
 
@@ -268,8 +285,9 @@ Set **View** to **Diagnostics** on a frame just after the cut:
 * `PAIR DIFF` is the difference between the two frames of the last motion
   step. Near 0.0000 means the host returned the same frame for different
   times (no temporal access), so there is no motion to work with.
-* `MV` is the mean motion vector length in px. `CACHED` / `FULL` says
-  whether the frame reused the previous result or rebuilt the chain.
+* `MV` is the mean motion vector length in px. `CACHED n` / `CHECKPOINT n`
+  / `FULL` says whether the frame continued from the cached result of frame
+  n, from the checkpoint at frame n, or ran the chain from the cut.
 * `Q` is the recovery progress (0..1, after the Recovery Curve), `REC` the
   recovery mode number (0-10 in menu order), `REFR` the share of blocks
   Motion-adaptive intra refresh has already refreshed (Encoder intra

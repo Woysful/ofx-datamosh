@@ -86,7 +86,8 @@ const char* kRecoverCurve = "recoverCurve"; // choice
 const char* kRecoverSoftness = "recoverSoftness"; // double 0..1
 const char* kRevealInvert = "revealInvert"; // bool
 const char* kDirection = "recoverDirection"; // choice: Wipe / Slice direction
-const char* kMaxSteps = "maxSteps";         // int
+const char* kMaxSteps = "maxSteps";         // int, hidden: kept so old projects load; chains always step frame by frame
+const char* kCheckpointMB = "checkpointMemory"; // int MB, shared by all instances
 const char* kClamp = "clampLevels";         // bool
 const char* kSeed = "seed";                 // int
 const char* kView = "view";                 // choice: result / motion vectors / diagnostics
@@ -464,7 +465,7 @@ struct Settings {
     float recoverSoftness = 0.5f;
     bool revealInvert = false;
     int direction = 0;
-    int maxSteps = 48;
+    int checkpointMB = 1024;
     bool clampLevels = true;
     int seed = 0;
     int view = 0;
@@ -499,7 +500,7 @@ static Settings readSettings(OfxParamSetHandle ps, double t) {
     s.recoverSoftness = (float)getDouble(ps, P::kRecoverSoftness, t, 0.5);
     s.revealInvert = getInt(ps, P::kRevealInvert, t, 0) != 0;
     s.direction = std::min(std::max(getInt(ps, P::kDirection, t, 0), 0), mosh::kDirectionCount - 1);
-    s.maxSteps = std::max(1, getInt(ps, P::kMaxSteps, t, 48));
+    s.checkpointMB = std::max(0, getInt(ps, P::kCheckpointMB, t, 1024));
     s.clampLevels = getInt(ps, P::kClamp, t, 1) != 0;
     s.seed = getInt(ps, P::kSeed, t, 0);
     s.view = getInt(ps, P::kView, t, 0);
@@ -515,7 +516,7 @@ static uint64_t chainHash(const Settings& s, const OfxRectI& r) {
     auto mixf = [&](float f) { uint32_t u; memcpy(&u, &f, 4); mix(u); };
     mix((uint64_t)s.block); mix((uint64_t)s.range); mixf(s.motionScale); mixf(s.residual);
     mix((uint64_t)s.repeat); mixf(s.intraThreshold); mix(s.smooth); mix(s.fillFlat);
-    mix((uint64_t)s.maxSteps); mix(s.clampLevels); mixf(s.intraRate); mix(s.subpel);
+    mix(s.clampLevels); mixf(s.intraRate); mix(s.subpel);
     const auto mode = (mosh::Recovery)s.recoverMode;
     if (mode == mosh::Recovery::MotionRefresh || mode == mosh::Recovery::Natural) {
         // these modes recover inside the chain
@@ -538,6 +539,98 @@ static float recoveryAmount(const Settings& s, double p) {
     const float q = (float)std::min(std::max((p - s.recoverStart) / (1.0 - s.recoverStart), 0.0), 1.0);
     return mosh::shapeCurve(q, (mosh::Curve)s.recoverCurve);
 }
+
+// ---------------------------------------------------------------- chain checkpoints
+
+// a is a whole number of frames (at least one) before t.
+static bool wholeFramesBefore(double a, double t) {
+    const double d = t - a;
+    return d > 0.5 && std::fabs(d - std::round(d)) < 1e-6;
+}
+
+// Accumulated pictures saved every few frames while a chain renders, so a
+// render that jumps into a mosh continues from the nearest one before it
+// instead of starting again at the cut. One store for the whole process:
+// the memory limit covers every instance, the least recently used go first.
+class CheckpointStore {
+public:
+    // Time of the newest checkpoint of the chain a whole number of frames
+    // before t, or -HUGE_VAL.
+    double latest(const void* owner, double t, double cut, uint64_t hash) {
+        std::lock_guard<std::mutex> g(m_);
+        double best = -HUGE_VAL;
+        for (const Entry& e : entries_)
+            if (e.owner == owner && e.cut == cut && e.hash == hash && e.t > cut && wholeFramesBefore(e.t, t) &&
+                e.t > best)
+                best = e.t;
+        return best;
+    }
+    bool has(const void* owner, double t, double cut, uint64_t hash) {
+        std::lock_guard<std::mutex> g(m_);
+        return find(owner, t, cut, hash) != entries_.end();
+    }
+    bool get(const void* owner, double t, double cut, uint64_t hash, mosh::Image& acc,
+             std::vector<uint8_t>& refreshed) {
+        std::lock_guard<std::mutex> g(m_);
+        auto it = find(owner, t, cut, hash);
+        if (it == entries_.end()) return false;
+        acc = it->acc;
+        refreshed = it->refreshed;
+        entries_.splice(entries_.end(), entries_, it);
+        return true;
+    }
+    void put(const void* owner, double t, double cut, uint64_t hash, mosh::Image acc,
+             const std::vector<uint8_t>& refreshed, size_t budget) {
+        const size_t bytes = acc.px.size() * sizeof(float) + refreshed.size();
+        std::lock_guard<std::mutex> g(m_);
+        if (find(owner, t, cut, hash) != entries_.end() || bytes > budget) return;
+        trimLocked(budget - bytes);
+        entries_.push_back({owner, t, cut, hash, std::move(acc), refreshed, bytes});
+        bytes_ += bytes;
+    }
+    // Drops the least recently used checkpoints until at most budget bytes are left.
+    void trim(size_t budget) {
+        std::lock_guard<std::mutex> g(m_);
+        trimLocked(budget);
+    }
+    void forget(const void* owner) {
+        std::lock_guard<std::mutex> g(m_);
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->owner == owner) {
+                bytes_ -= it->bytes;
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+private:
+    struct Entry {
+        const void* owner;
+        double t, cut;
+        uint64_t hash;
+        mosh::Image acc;
+        std::vector<uint8_t> refreshed;
+        size_t bytes;
+    };
+    std::list<Entry>::iterator find(const void* owner, double t, double cut, uint64_t hash) {
+        for (auto it = entries_.begin(); it != entries_.end(); ++it)
+            if (it->owner == owner && it->t == t && it->cut == cut && it->hash == hash) return it;
+        return entries_.end();
+    }
+    void trimLocked(size_t budget) {
+        while (bytes_ > budget && !entries_.empty()) {
+            bytes_ -= entries_.front().bytes;
+            entries_.pop_front();
+        }
+    }
+    std::mutex m_;
+    std::list<Entry> entries_;  // least recently used first
+    size_t bytes_ = 0;
+};
+
+static CheckpointStore gCheckpoints;
 
 // ---------------------------------------------------------------- per-instance cache
 
@@ -590,15 +683,16 @@ struct Instance {
     // the host itself; its followers stop waiting for it.
     static constexpr std::chrono::seconds kStall{10};
 
-    ~Instance() { mosh_gpu::forget(this); }
-
-    // a is a whole number of frames (at least one) before t.
-    static bool before(double a, double t) {
-        const double d = t - a;
-        return d > 0.5 && std::fabs(d - std::round(d)) < 1e-6;
+    ~Instance() {
+        gCheckpoints.forget(this);
+        mosh_gpu::forget(this);
     }
+
+    static bool before(double a, double t) { return wholeFramesBefore(a, t); }
+    // Newest picture of the chain before t that a render could continue
+    // from: cached on the CPU or the GPU, or a checkpoint.
     double latestStoredLocked(double t, double cut, uint64_t hash) const {
-        double best = -HUGE_VAL;
+        double best = gCheckpoints.latest(this, t, cut, hash);
         for (const Stored& s : stored)
             if (s.cut == cut && s.hash == hash && s.t >= cut && before(s.t, t) && s.t > best) best = s.t;
         return best;
@@ -656,6 +750,7 @@ struct Instance {
             frame.reset();
         }
         busyDone.notify_all();
+        gCheckpoints.forget(this);
         // Outside m: a GPU render holds the GPU while it takes m.
         mosh_gpu::forget(this);
     }
@@ -814,15 +909,13 @@ static void finishPlan(Plan& pl) {
     pl.q = recoveryAmount(pl.s, pl.progress);
     pl.passThrough = pl.t < pl.cutFrame - 1e-9 || pl.progress >= 1.0;
     pl.nFrames = std::max(0, (int)std::lround(pl.t - pl.cutFrame));
-    pl.steps = std::min(pl.nFrames, pl.s.maxSteps);
+    // One step per frame, always: a chain sampled at a coarser stride could
+    // not continue from the previous frame's result and would differ from
+    // frame to frame. Checkpoints keep jumps into a mosh cheap instead.
+    pl.steps = pl.nFrames;
     pl.times.clear();
-    if (pl.steps > 0) {
-        for (int i = 0; i <= pl.steps; ++i) {
-            const double ft = pl.cutFrame + std::round((double)i * (double)pl.nFrames / (double)pl.steps);
-            if (pl.times.empty() || ft > pl.times.back()) pl.times.push_back(ft);
-        }
-        pl.steps = (int)pl.times.size() - 1;
-    }
+    if (pl.steps > 0)
+        for (int i = 0; i <= pl.steps; ++i) pl.times.push_back(pl.cutFrame + (double)i);
 }
 
 // Keyframes mode: the most recent keyframe of Cut Markers at or before t is
@@ -1135,10 +1228,17 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect) {
               "of Encoder intra decisions.", 0, 0, 9999);
 
     beginGroup(ps, P::kGrpAdvanced, "Performance & Debug", "Speed limits and debug views.", true);
-    defineInt(ps, P::kMaxSteps, "Max Motion Steps",
-              "Upper bound on frame pairs analysed per output frame when the cache is cold. Lower is faster; "
-              "motion is then sampled at a coarser stride.",
-              48, 1, 240);
+    defineInt(ps, P::kCheckpointMB, "Checkpoint Memory (MB)",
+              "RAM for pictures saved every few frames of a mosh while it renders, so jumping or scrubbing into a "
+              "mosh rendered before continues from the nearest one instead of starting again at the cut. Shared "
+              "by all Datamosh effects, the oldest go first; 0 turns checkpoints off. Does not change the result.",
+              1024, 0, 65536);
+    {
+        OfxPropertySetHandle p = defineParam(ps, kOfxParamTypeInteger, P::kMaxSteps, "Max Motion Steps",
+                                             "No longer used: every frame of the mosh is one motion step.");
+        gProp->propSetInt(p, kOfxParamPropDefault, 0, 48);
+        gProp->propSetInt(p, kOfxParamPropSecret, 0, 1);
+    }
     {
         OfxPropertySetHandle p = defineParam(
             ps, kOfxParamTypeChoice, P::kDevice, "Render Device",
@@ -1239,7 +1339,6 @@ static const PresetParam kPresetParams[] = {
     {P::kSearchRange, false}, {P::kSubpel, false},        {P::kIntra, true},        {P::kSmooth, false},
     {P::kFillFlat, false},    {P::kRecoverMode, false},   {P::kRecoverStart, true}, {P::kRecoverCurve, false},
     {P::kRecoverSoftness, true}, {P::kRevealInvert, false}, {P::kDirection, false}, {P::kSeed, false},
-    {P::kMaxSteps, false},
 };
 
 #ifdef _WIN32
@@ -1739,9 +1838,25 @@ struct ChainResult {
     int stepsDone = 0;
     bool fromCache = false;
     double startT = -HUGE_VAL;       // frame of the cached picture the chain continued from
+    bool fromCheckpoint = false;     // ... which was a checkpoint
     bool aborted = false;
     std::vector<uint8_t> refreshed;  // Motion refresh state, carried along the chain
     std::string device;              // where it was computed, for Diagnostics
+};
+
+// Where and how often a render saves checkpoints of its chain.
+struct CheckpointPlan {
+    const void* owner = nullptr;
+    double cut = 0;
+    uint64_t hash = 0;
+    size_t budget = 0;
+    long every = 0;  // frames between checkpoints, counted from the cut; 0: none
+
+    bool due(double ft) const {
+        if (!owner || every <= 0) return false;
+        const long i = std::lround(ft - cut);
+        return i > 0 && i % every == 0 && std::fabs(ft - cut - (double)i) < 1e-6;
+    }
 };
 
 // Source frames for one render, converted to the output's pixel rectangle.
@@ -1756,6 +1871,7 @@ struct FrameSource {
     double tPrev = 0;
     FramePtr prev;
     const ChainTicket* ticket = nullptr;  // told about every finished step
+    const CheckpointPlan* checkpoints = nullptr;
     mutable int fetched = 0;              // frames fetched from the host by get()
 
     FramePtr get(double t) const {
@@ -1767,7 +1883,7 @@ struct FrameSource {
 };
 
 // Unit steps from frame a to frame t, a whole number of frames before it:
-// the tail of the unstrided chain from the cut.
+// the tail of the chain from the cut.
 static std::vector<double> stepsFrom(double a, double t) {
     const long n = std::lround(t - a);
     std::vector<double> ts;
@@ -1857,6 +1973,16 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
         }
         prev = std::move(cur);
         ++cr.stepsDone;
+        const CheckpointPlan* ck = fs.checkpoints;
+        if (ck && ck->due(times[i]) && !gCheckpoints.has(ck->owner, times[i], ck->cut, ck->hash)) {
+            mosh::Image copy;
+            if (gpu) {
+                if (!gpu->downloadAcc(copy)) return false;
+            } else {
+                copy = acc;
+            }
+            gCheckpoints.put(ck->owner, times[i], ck->cut, ck->hash, std::move(copy), cr.refreshed, ck->budget);
+        }
         if (fs.ticket) fs.ticket->beat();
     }
     return true;
@@ -1864,31 +1990,38 @@ static bool runSteps(OfxImageEffectHandle inst, const FrameSource& fs, const Pla
 // The chain and the recovery on the GPU, with the same result as the CPU
 // path of render(); false on a GPU error (result and cr are then partial).
 static bool renderOnGpu(OfxImageEffectHandle inst, mosh_gpu::Session& gpu, Instance* cache, const FrameSource& fs,
-                        const Plan& pl, bool unstrided, bool composeNeeded, const mosh::ComposeParams& cp,
+                        const Plan& pl, bool composeNeeded, const mosh::ComposeParams& cp,
                         mosh::Image& result, ChainResult& cr, const mosh::ParallelFor& pf) {
     const uint64_t hash = chainHash(pl.s, fs.rect);
     const double t = pl.t;
     mosh::Image unused;
     bool ok;
-    // Continue from the newest cached picture of the chain, on the GPU or the CPU.
-    const bool reuse = unstrided && pl.nFrames >= 1 && cache;
+    // Continue from the newest cached picture of the chain, on the GPU or the
+    // CPU, or from the newest checkpoint.
+    const bool reuse = pl.nFrames >= 1 && cache;
     const double onGpu = reuse ? gpu.latestAcc(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
     const double onCpu = reuse ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
-    if (onGpu > -HUGE_VAL && onGpu >= onCpu && gpu.restoreAcc(cache, onGpu, pl.cutFrame, hash, cr.refreshed)) {
+    const double onCk = reuse ? gCheckpoints.latest(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
+    if (onGpu > -HUGE_VAL && onGpu >= onCpu && onGpu >= onCk &&
+        gpu.restoreAcc(cache, onGpu, pl.cutFrame, hash, cr.refreshed)) {
         cr.fromCache = true;
         cr.startT = onGpu;
         ok = runSteps(inst, fs, pl, stepsFrom(onGpu, t), unused, cr, pf, &gpu);
-    } else if (onCpu > -HUGE_VAL && cache->getAcc(onCpu, pl.cutFrame, hash, unused, cr.refreshed)) {
+    } else if (onCpu > -HUGE_VAL && onCpu >= onCk && cache->getAcc(onCpu, pl.cutFrame, hash, unused, cr.refreshed)) {
         cr.fromCache = true;
         cr.startT = onCpu;
         ok = gpu.setAcc(unused) && runSteps(inst, fs, pl, stepsFrom(onCpu, t), unused, cr, pf, &gpu);
+    } else if (onCk > -HUGE_VAL && gCheckpoints.get(cache, onCk, pl.cutFrame, hash, unused, cr.refreshed)) {
+        cr.fromCache = cr.fromCheckpoint = true;
+        cr.startT = onCk;
+        ok = gpu.setAcc(unused) && runSteps(inst, fs, pl, stepsFrom(onCk, t), unused, cr, pf, &gpu);
     } else {
         cr.refreshed.clear();
         FramePtr ref = fs.get(pl.cutFrame - 1.0);
         ok = gpu.setAcc(ref ? *ref : *fs.cur) && runSteps(inst, fs, pl, pl.times, unused, cr, pf, &gpu);
     }
     if (!ok) return false;
-    const bool store = cache && unstrided && !cr.aborted;
+    const bool store = cache && !cr.aborted;
     if (composeNeeded) {
         if (!gpu.compose(fs.cur, cp, pl.q, result)) return false;
     } else {
@@ -1934,7 +2067,9 @@ static void drawDiagnostics(mosh::Image& img, const Plan& pl, const ChainResult&
     line("SCAN MAX DIFF " + fmt("%.4f", pl.scanMaxDiff) + "  THR " + fmt("%.3f", pl.s.cutThreshold) +
          "  FETCHED " + fmt("%.0f", pl.scanned));
     line("N " + fmt("%.0f", pl.nFrames) + "  STEPS " + fmt("%.0f", pl.steps) + "  DONE " + fmt("%.0f", cr.stepsDone) +
-         (cr.fromCache ? "  CACHED" : "  FULL"));
+         (cr.fromCheckpoint ? "  CHECKPOINT " + fmt("%.0f", cr.startT)
+          : cr.fromCache    ? "  CACHED " + fmt("%.0f", cr.startT)
+                            : "  FULL"));
     line("PAIR DIFF " + fmt("%.4f", cr.firstPairDiff));
     line("MV " + fmt("%.2f", mv) + " PX  INTRA " + fmt("%.0f", intra) + "  Q " + fmt("%.2f", pl.q) +
          "  REC " + fmt("%.0f", pl.s.recoverMode) +
@@ -1961,7 +2096,7 @@ static void logRender(double t, double ms, double waitedMs, const Plan& pl, cons
     const double at = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     char from[32];
     if (pl.passThrough) snprintf(from, sizeof from, "-");
-    else if (cr.fromCache) snprintf(from, sizeof from, "%.0f", cr.startT);
+    else if (cr.fromCache) snprintf(from, sizeof from, cr.fromCheckpoint ? "%.0f ckpt" : "%.0f", cr.startT);
     else snprintf(from, sizeof from, "cut");
     fprintf(fp, "%10.1f thr %08x t %.1f %8.1f ms wait %7.1f n %d from %s steps %d fetched %d scanned %d %s\n", at,
             (unsigned)std::hash<std::thread::id>()(std::this_thread::get_id()), t, ms, waitedMs, pl.nFrames, from,
@@ -2027,12 +2162,27 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         return finish();
     }
 
-    const bool unstrided = pl.steps == pl.nFrames;
     ChainTicket ticket;
-    if (cache && unstrided && !pl.passThrough) {
+    CheckpointPlan ck;
+    const size_t budget = (size_t)s.checkpointMB << 20;
+    gCheckpoints.trim(budget);
+    if (cache && !pl.passThrough) {
         ticket.in = cache;
         ticket.it = cache->enter(t, pl.cutFrame, chainHash(s, R), waitedMs);
         fs.ticket = &ticket;
+        // As many checkpoints as the budget holds over one mosh, at least
+        // kMinEvery frames apart so that saving them costs little.
+        constexpr long kMinEvery = 8;
+        const size_t frameBytes = (size_t)std::max(0, R.x2 - R.x1) * (size_t)std::max(0, R.y2 - R.y1) * 4 * sizeof(float);
+        const size_t fit = frameBytes ? budget / frameBytes : 0;
+        if (fit > 0) {
+            ck.owner = cache;
+            ck.cut = pl.cutFrame;
+            ck.hash = chainHash(s, R);
+            ck.budget = budget;
+            ck.every = std::max(kMinEvery, (long)((std::max(1, s.moshLength) + fit - 1) / fit));
+            fs.checkpoints = &ck;
+        }
     }
     const auto mode = (mosh::Recovery)s.recoverMode;
     // These modes recover inside the chain; compose only matters at the very end.
@@ -2051,7 +2201,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     if (!pl.passThrough && s.view != 1 && (mosh_gpu::Preference)s.device != mosh_gpu::Preference::Cpu) {
         std::string why;
         std::unique_ptr<mosh_gpu::Session> gpu = mosh_gpu::begin((mosh_gpu::Preference)s.device, why);
-        if (gpu && renderOnGpu(inst, *gpu, cache, fs, pl, unstrided, composeNeeded, cp, result, cr, pf)) {
+        if (gpu && renderOnGpu(inst, *gpu, cache, fs, pl, composeNeeded, cp, result, cr, pf)) {
             cr.device = gpu->label();
             gpu.reset();
             ticket.done();
@@ -2067,13 +2217,19 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
     uint64_t hash = 0;
     if (!pl.passThrough) {
         hash = chainHash(s, R);
-        // Fast path: an earlier frame's accumulated picture is cached and the
-        // chain is unstrided, so the steps from there give exactly the same result.
-        const double from = unstrided && pl.nFrames >= 1 && cache ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
-        if (from > -HUGE_VAL && cache->getAcc(from, pl.cutFrame, hash, acc, cr.refreshed)) {
+        // Fast path: an earlier frame's accumulated picture is cached or
+        // checkpointed, and the steps from there give exactly the same result.
+        const bool reuse = pl.nFrames >= 1 && cache;
+        const double onCpu = reuse ? cache->latestAcc(t, pl.cutFrame, hash) : -HUGE_VAL;
+        const double onCk = reuse ? gCheckpoints.latest(cache, t, pl.cutFrame, hash) : -HUGE_VAL;
+        if (onCpu > -HUGE_VAL && onCpu >= onCk && cache->getAcc(onCpu, pl.cutFrame, hash, acc, cr.refreshed)) {
             cr.fromCache = true;
-            cr.startT = from;
-            runSteps(inst, fs, pl, stepsFrom(from, t), acc, cr, pf);
+            cr.startT = onCpu;
+            runSteps(inst, fs, pl, stepsFrom(onCpu, t), acc, cr, pf);
+        } else if (onCk > -HUGE_VAL && gCheckpoints.get(cache, onCk, pl.cutFrame, hash, acc, cr.refreshed)) {
+            cr.fromCache = cr.fromCheckpoint = true;
+            cr.startT = onCk;
+            runSteps(inst, fs, pl, stepsFrom(onCk, t), acc, cr, pf);
         } else {
             // Reference picture: the last frame before the cut, the one the decoder is stuck with.
             FramePtr ref = fs.get(pl.cutFrame - 1.0);
@@ -2084,7 +2240,7 @@ static OfxStatus render(OfxImageEffectHandle inst, OfxPropertySetHandle inArgs) 
         acc = *fs.cur;
     }
     // An aborted chain is incomplete and must not seed later frames.
-    const bool store = cache && unstrided && !pl.passThrough && !cr.aborted;
+    const bool store = cache && !pl.passThrough && !cr.aborted;
 
     if (s.view == 1) {
         if (cr.lastField.bw == 0) {
@@ -2139,7 +2295,9 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
                 gProp->propGetString(inArgs, kOfxPropName, 0, &name);
                 gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
             }
+            // Checkpoint Memory changes no picture, so the caches stay.
             const bool noRender = name && (!strcmp(name, P::kPresetName) || !strcmp(name, P::kPresetSave) ||
+                                           !strcmp(name, P::kCheckpointMB) ||
                                            !strcmp(name, P::kPresetList) || !strcmp(name, P::kPresetLoad) ||
                                            !strcmp(name, P::kPresetDelete));
             if (!noRender)

@@ -132,12 +132,14 @@ Messages the plugin shows through the message suite are printed as
 any order, the way hosts render during playback; `MOCK_TIMES=1` prints the
 render time and the number of source frames fetched for every frame, and
 `MOCK_FETCH_MS=n` makes each source fetch take n ms, like a host that
-decodes or renders the input on demand.
+decodes or renders the input on demand. `MOCK_ORDER=i,j,...` renders the
+listed frames (0-based) in that order, like jumping around a timeline; each
+frame's output still goes to its own place in the output file.
 
 Setting `OFX_DATAMOSH_LOG` to a file path before starting a host makes the
 plugin append one line per render: the thread, the time spent and the time
 waited for an earlier frame, the frame the chain continued from (`cut` for
-a full rebuild), the steps run, the source frames fetched and the device.
+a full rebuild, `n ckpt` for a checkpoint), the steps run, the source frames fetched and the device.
 That shows how a host schedules renders.
 
 `build/mosh_test` runs only the algorithm core on two raw clips.

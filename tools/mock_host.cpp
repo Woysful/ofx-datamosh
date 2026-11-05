@@ -660,7 +660,22 @@ int main(int argc, char** argv) {
         printf("done\n");
         return 0;
     }
-    for (int i = 0; i < total; ++i) {
+    // MOCK_ORDER=i,j,...: render frames in this order (like jumping around the
+    // timeline); each frame's output still goes to its own slot.
+    std::vector<int> order;
+    if (const char* e = getenv("MOCK_ORDER"))
+        for (const char* p = e; *p;) {
+            char* end = nullptr;
+            const long v = strtol(p, &end, 10);
+            if (end == p) break;
+            if (v >= 0 && v < total) order.push_back((int)v);
+            p = *end == ',' ? end + 1 : end;
+        }
+    const size_t slotBytes = getenv("MOCK_FLOAT") ? (size_t)w * h * 4 * sizeof(float) : rgbOut.size();
+    const int count = order.empty() ? total : (int)order.size();
+    for (int k = 0; k < count; ++k) {
+        const int i = order.empty() ? k : order[k];
+        if (!order.empty()) fseek(fo, (long)(slotBytes * (size_t)i), SEEK_SET);
         const double t = gT0 + i;
         PropSet inArgs, outArgs;
         inArgs.d[kOfxPropTime] = {t};
