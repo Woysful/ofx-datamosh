@@ -6,12 +6,16 @@ cut melt the way a video with a deleted keyframe does. Or mosh a single clip:
 from a frame you pick, its last P-frames repeat over and over and the picture
 flows on along their motion (duplicated P-frames).
 
-|  |  |
+
+|Transition Intra + half-pel| Transition P-only, full-pel|
 |:---:|:---:|
 |![](docs/example1.webp)|![](docs/example2.webp)|
+| | |
 
+| Repeat frames mode| |
+|:---:|:---:|
 ![](docs/example3_repeat_mode.webp)
----
+| | |
 
 
 Made for DaVinci Resolve; works in other OpenFX hosts that let a filter read
