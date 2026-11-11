@@ -10,12 +10,10 @@ flows on along their motion (duplicated P-frames).
 |Transition Intra + half-pel| Transition P-only, full-pel|
 |:---:|:---:|
 |![](docs/example1.webp)|![](docs/example2.webp)|
-| | |
 
 | Repeat frames mode|
 |:---:|
 ![](docs/example3_repeat_mode.webp)
-| |
 
 
 Made for DaVinci Resolve; works in other OpenFX hosts that let a filter read
