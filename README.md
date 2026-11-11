@@ -6,7 +6,13 @@ cut melt the way a video with a deleted keyframe does. Or mosh a single clip:
 from a frame you pick, its last P-frames repeat over and over and the picture
 flows on along their motion (duplicated P-frames).
 
-![sample](docs/sample.png)
+|  |  |
+|:---:|:---:|
+|![](docs/example1.webp)|![](docs/example2.webp)|
+
+![](docs/example3_repeat_mode.webp)
+---
+
 
 Made for DaVinci Resolve; works in other OpenFX hosts that let a filter read
 neighbouring frames ([Hosts](https://github.com/Woysful/ofx-datamosh/blob/main/docs/hosts.md)).
